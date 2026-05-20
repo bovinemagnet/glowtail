@@ -129,7 +129,7 @@ impl Engine {
             }
         }
 
-        if spans.is_empty() || !is_match {
+        if !is_match {
             spans.push(StyledSpan {
                 kind: SpanKind::Message,
                 text: row.message.clone(),

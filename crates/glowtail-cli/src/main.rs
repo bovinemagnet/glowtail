@@ -43,9 +43,9 @@ async fn main() -> Result<()> {
             filter,
             level,
             no_follow,
-            from_start,
+            from_start: _from_start,
         } => {
-            let mut engine = load_initial_engine(paths, parser_from_flags(json, plain), from_start)
+            let mut engine = load_initial_engine(paths, parser_from_flags(json, plain))
                 .await
                 .context("failed to load logs")?;
             apply_filters(&mut engine, filter, level)?;
@@ -67,11 +67,7 @@ fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
     }
 }
 
-async fn load_initial_engine(
-    paths: Vec<PathBuf>,
-    parser: Arc<dyn LogParser>,
-    from_start: bool,
-) -> Result<Engine> {
+async fn load_initial_engine(paths: Vec<PathBuf>, parser: Arc<dyn LogParser>) -> Result<Engine> {
     let mut engine = Engine::default();
     let mut source_counter = 0u64;
 
@@ -93,10 +89,6 @@ async fn load_initial_engine(
             );
             engine.append_row(row);
             offset = end;
-        }
-
-        if !from_start && engine.total_rows() > 0 {
-            let _ = source_id;
         }
     }
 
