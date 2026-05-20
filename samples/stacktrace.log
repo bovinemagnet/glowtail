@@ -1,0 +1,4 @@
+2026-05-21T10:17:00Z ERROR request failed
+java.lang.NullPointerException: boom
+    at com.example.Service.run(Service.java:42)
+    at com.example.Main.main(Main.java:9)

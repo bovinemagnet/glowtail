@@ -1,0 +1,3 @@
+{"timestamp":"2026-05-21T10:15:30Z","level":"INFO","message":"service started","service":"billing"}
+{"timestamp":"2026-05-21T10:16:02Z","level":"WARN","message":"retrying request","attempt":2}
+{"timestamp":"2026-05-21T10:16:11Z","level":"ERROR","message":"failed to connect","service":"billing"}
