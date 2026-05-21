@@ -1,6 +1,6 @@
 use anyhow::{Context as AnyhowContext, Result};
 use clap::{Parser, ValueEnum};
-use glowtail_core::filter::compose_filter;
+use glowtail_core::filter::compose_query_filter;
 use glowtail_core::prelude::*;
 use gpui::{
     App, Application, Bounds, Context, IntoElement, ListAlignment, ListState, ParentElement,
@@ -176,7 +176,7 @@ fn apply_filters(
         })
         .transpose()?;
     let level: Option<LogLevel> = level.map(Into::into);
-    let filter = compose_filter(saved.as_ref(), level, filter_text.as_deref());
+    let filter = compose_query_filter(saved.as_ref(), level, filter_text.as_deref())?;
     engine.set_filter(filter)?;
     if let Some(name) = save_filter {
         engine.save_filter(name);

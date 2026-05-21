@@ -96,6 +96,23 @@ pub struct TimelineBucket {
     pub total: usize,
     pub warn: usize,
     pub error: usize,
+    pub level_counts: LevelCounts,
+    pub source_count: usize,
+    pub top_source_id: Option<SourceId>,
+    pub top_source_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TimelineAnalytics {
+    pub timestamped_rows: usize,
+    pub untimestamped_rows: usize,
+    pub first_timestamp: Option<DateTime<Utc>>,
+    pub last_timestamp: Option<DateTime<Utc>>,
+    pub peak_total_bucket: Option<usize>,
+    pub peak_error_bucket: Option<usize>,
+    pub peak_warn_bucket: Option<usize>,
+    pub error_rows: usize,
+    pub warn_rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -236,6 +253,7 @@ pub struct ViewportSnapshot {
     pub level_counts: LevelCounts,
     pub source_summaries: Vec<SourceSummary>,
     pub timeline: Vec<TimelineBucket>,
+    pub timeline_analytics: TimelineAnalytics,
 }
 
 #[cfg(test)]

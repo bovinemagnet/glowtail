@@ -130,9 +130,9 @@ fn apply_input(engine: &mut Engine, state: &mut TuiState) {
         InputMode::Filter => {
             if state.input.trim().is_empty() {
                 engine.clear_filter();
-            } else if let Err(err) = engine.set_filter(glowtail_core::filter::FilterExpr::Contains(
-                state.input.clone(),
-            )) {
+            } else if let Err(err) = glowtail_core::filter::parse_filter_query(&state.input)
+                .and_then(|filter| engine.set_filter(filter))
+            {
                 state.status_message = Some(format!("filter error: {err}"));
             }
         }

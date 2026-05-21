@@ -109,7 +109,7 @@ pub fn render(
     frame.render_widget(viewport, layout[1]);
 
     let help = Paragraph::new(format!(
-        "q quit | j/k select | f follow | b bookmark | z fold | / search | n/N next | F filter | Esc clear | input={input}"
+        "q quit | j/k select | f follow | b bookmark | z fold | / search | n/N next | F query | Esc clear | input={input}"
     ));
     frame.render_widget(help, layout[2]);
 }

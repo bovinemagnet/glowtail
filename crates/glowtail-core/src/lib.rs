@@ -18,7 +18,9 @@ pub mod viewport;
 /// should prefer this prelude so the API surface has one place to evolve.
 pub mod prelude {
     pub use crate::events::LogEvent;
-    pub use crate::filter::{FilterError, FilterExpr, compose_filter};
+    pub use crate::filter::{
+        FilterError, FilterExpr, compose_filter, compose_query_filter, parse_filter_query,
+    };
     pub use crate::model::{
         ByteRange, LogLevel, LogRow, RowId, RowPresentation, SeverityRole, SourceId, SpanKind,
         StyledSpan, ViewportRequest, ViewportSnapshot,

@@ -241,7 +241,8 @@ fn apply_filters_and_save(
         })
         .transpose()?;
     let level: Option<LogLevel> = level.map(Into::into);
-    let filter = compose_filter(saved.as_ref(), level, filter_text.as_deref());
+    let filter =
+        glowtail_core::filter::compose_query_filter(saved.as_ref(), level, filter_text.as_deref())?;
     engine.set_filter(filter.clone())?;
     if let Some(name) = save_filter {
         engine.save_filter(name);

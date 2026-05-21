@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use eframe::egui;
-use glowtail_core::filter::compose_filter;
+use glowtail_core::filter::{compose_query_filter, parse_filter_query};
 use glowtail_core::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -136,7 +136,7 @@ fn apply_filters(
         })
         .transpose()?;
     let level: Option<LogLevel> = level.map(Into::into);
-    let filter = compose_filter(saved.as_ref(), level, filter_text.as_deref());
+    let filter = compose_query_filter(saved.as_ref(), level, filter_text.as_deref())?;
     engine.set_filter(filter)?;
     if let Some(name) = save_filter {
         engine.save_filter(name);
@@ -267,7 +267,8 @@ impl GlowtailGui {
                 let filter_changed = ui
                     .add_sized(
                         [240.0, 24.0],
-                        egui::TextEdit::singleline(&mut self.filter_text).hint_text("contains..."),
+                        egui::TextEdit::singleline(&mut self.filter_text)
+                            .hint_text("query or contains..."),
                     )
                     .changed();
 
@@ -281,11 +282,11 @@ impl GlowtailGui {
 
                 if filter_changed {
                     let filter = if self.filter_text.trim().is_empty() {
-                        FilterExpr::All
+                        Ok(FilterExpr::All)
                     } else {
-                        FilterExpr::Contains(self.filter_text.clone())
+                        parse_filter_query(&self.filter_text)
                     };
-                    if let Err(err) = self.engine.set_filter(filter) {
+                    if let Err(err) = filter.and_then(|filter| self.engine.set_filter(filter)) {
                         self.status_message = Some(format!("filter error: {err}"));
                     }
                 }
@@ -596,7 +597,7 @@ impl GlowtailGui {
                     if ui.button("Clear filter").clicked() {
                         self.clear_filter();
                     }
-                    ui.label("Remove contains/level filter");
+                    ui.label("Remove query/level filter");
                     ui.end_row();
                     if ui.button("Clear search").clicked() {
                         self.clear_search();

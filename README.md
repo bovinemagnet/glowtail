@@ -28,17 +28,17 @@ cargo run -p glowtail-cli -- tail samples/mixed.log --level warn --no-follow --f
 ```bash
 cargo run -p glowtail-cli -- view samples/mixed.log
 cargo run -p glowtail-cli -- view samples/json.log --json
-cargo run -p glowtail-cli -- view samples/mixed.log --filter billing --level warn
+cargo run -p glowtail-cli -- view samples/mixed.log --filter 'service = "billing" and level >= warn'
 ```
 
 `tail` prints matching raw log lines to stdout and is useful for scripts or quick checks:
 
 ```bash
 cargo run -p glowtail-cli -- tail samples/mixed.log --level warn --no-follow
-cargo run -p glowtail-cli -- tail samples/json.log --json --filter billing --no-follow
+cargo run -p glowtail-cli -- tail samples/json.log --json --filter 'service = "billing"' --no-follow
 ```
 
-Use `--json` to force JSON-lines parsing, `--plain` to force plain-text parsing, or omit both to use the composite parser. `--filter` performs a case-insensitive contains match against the raw log line, including JSON fields. `--level` keeps rows at or above the selected level.
+Use `--json` to force JSON-lines parsing, `--plain` to force plain-text parsing, or omit both to use the composite parser. `--filter timeout` still performs a case-insensitive contains match against the raw log line. Query filters also support `level = error`, `level in (warn, error)`, `message contains "timeout"`, `service = "billing"`, `json.userId = "123"`, `source = 1`, and timestamp ranges such as `timestamp between "2026-05-21T09:00:00Z" and "2026-05-21T10:00:00Z"`. `--level` keeps rows at or above the selected level and composes with `--filter`.
 
 ## Native GPU UI
 
@@ -94,7 +94,7 @@ cargo run -p glowtail-cli -- view samples/mixed.log --from-start
 - `z`: toggle stack-trace folding
 - `Esc`: leave input mode
 
-The status bar shows matching rows, total rows, warning/error counts, source summaries, follow mode, stack folding state, timeline bucket count, and any transient error (for example, a filter that failed to compile).
+The status bar shows matching rows, total rows, warning/error counts, source summaries, follow mode, stack folding state, timeline bucket count, and any transient error (for example, a filter that failed to compile). Timeline metadata also tracks timestamp coverage, warning/error peaks, per-bucket severity counts, and the dominant source in each bucket for UI analytics.
 
 ## Sessions and Saved Filters
 
@@ -113,6 +113,51 @@ cargo run -p glowtail-cli -- tail samples/mixed.log \
 ```
 
 The same flags work with `view`, so bookmarks made in the TUI can be saved when the app exits.
+
+## Building release binaries
+
+The workspace produces three runnable binaries: `glowtail-cli` (terminal), `glowtail-gui` (egui/wgpu), and `glowtail-gpui` (GPUI). Release builds land in `target/release/`.
+
+Build one binary:
+
+```bash
+cargo build --release -p glowtail-cli      # → target/release/glowtail-cli
+cargo build --release -p glowtail-gui      # → target/release/glowtail-gui
+cargo build --release -p glowtail-gpui     # → target/release/glowtail-gpui
+```
+
+Build all three at once:
+
+```bash
+cargo build --release --workspace
+```
+
+Run a built binary directly (no `cargo` afterwards):
+
+```bash
+./target/release/glowtail-cli view samples/mixed.log
+./target/release/glowtail-gui samples/mixed.log
+./target/release/glowtail-gpui samples/mixed.log
+```
+
+Install into `~/.cargo/bin/` so the binary is on `$PATH`:
+
+```bash
+cargo install --path crates/glowtail-cli
+glowtail-cli view samples/mixed.log
+```
+
+Optional: strip debug info to shrink the binary, or add a `[profile.release]` block to `Cargo.toml` with `lto = "thin"`, `codegen-units = 1`, and `strip = true` for an aggressively optimised build:
+
+```bash
+strip target/release/glowtail-cli
+```
+
+On Linux the GPU front-ends need a few system libraries at build *and* run time; the CLI binary has no such requirements. On Debian/Ubuntu:
+
+```bash
+sudo apt-get install libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+```
 
 ## Development
 

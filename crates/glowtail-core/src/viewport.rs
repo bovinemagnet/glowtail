@@ -2,8 +2,8 @@ use crate::filter::{CompiledFilter, FilterExpr};
 use crate::index::RowIndex;
 use crate::model::{
     ByteRange, LevelCounts, LogLevel, LogRow, LogSourceKind, RowId, RowPresentation, SourceId,
-    SourceInfo, SourceSummary, SpanKind, StyledSpan, TimelineBucket, ViewportRequest,
-    ViewportSnapshot,
+    SourceInfo, SourceSummary, SpanKind, StyledSpan, TimelineAnalytics, TimelineBucket,
+    ViewportRequest, ViewportSnapshot,
 };
 use crate::parser::LogParser;
 use crate::session::InvestigationSession;
@@ -145,7 +145,8 @@ impl Engine {
             .map(|position| self.present_row(&raw_rows[*position]))
             .collect();
 
-        let (level_counts, source_summaries, timeline) = self.aggregate_for_positions(positions);
+        let (level_counts, source_summaries, timeline, timeline_analytics) =
+            self.aggregate_for_positions(positions);
 
         ViewportSnapshot {
             rows,
@@ -156,6 +157,7 @@ impl Engine {
             level_counts,
             source_summaries,
             timeline,
+            timeline_analytics,
         }
     }
 
@@ -186,7 +188,8 @@ impl Engine {
             .as_ref()
             .expect("cache populated by ensure_cache");
         let total = positions.len();
-        let (level_counts, source_summaries, timeline) = self.aggregate_for_positions(positions);
+        let (level_counts, source_summaries, timeline, timeline_analytics) =
+            self.aggregate_for_positions(positions);
 
         ViewportSnapshot {
             rows: Vec::new(),
@@ -197,6 +200,7 @@ impl Engine {
             level_counts,
             source_summaries,
             timeline,
+            timeline_analytics,
         }
     }
 
@@ -299,12 +303,14 @@ impl Engine {
                 level_counts: LevelCounts::default(),
                 source_summaries: Vec::new(),
                 timeline: Vec::new(),
+                timeline_analytics: TimelineAnalytics::default(),
             };
         };
         let first_row = position.saturating_sub(before);
         let row_count = before + after + 1;
         let window: Vec<&LogRow> = self.index.iter_range(first_row, row_count);
         let rows = window.iter().map(|row| self.present_row(row)).collect();
+        let (timeline, timeline_analytics) = Self::timeline(&window, 24);
 
         ViewportSnapshot {
             rows,
@@ -314,7 +320,8 @@ impl Engine {
             has_more_after: first_row + window.len() < self.total_rows(),
             level_counts: Self::level_counts(&window),
             source_summaries: self.source_summaries(&window),
-            timeline: Self::timeline(&window, 24),
+            timeline,
+            timeline_analytics,
         }
     }
 
@@ -365,13 +372,20 @@ impl Engine {
     fn aggregate_for_positions(
         &self,
         positions: &[usize],
-    ) -> (LevelCounts, Vec<SourceSummary>, Vec<TimelineBucket>) {
+    ) -> (
+        LevelCounts,
+        Vec<SourceSummary>,
+        Vec<TimelineBucket>,
+        TimelineAnalytics,
+    ) {
         let raw = self.index.rows();
         let rows: Vec<&LogRow> = positions.iter().map(|p| &raw[*p]).collect();
+        let (timeline, timeline_analytics) = Self::timeline(&rows, 24);
         (
             Self::level_counts(&rows),
             self.source_summaries(&rows),
-            Self::timeline(&rows, 24),
+            timeline,
+            timeline_analytics,
         )
     }
 
@@ -403,27 +417,45 @@ impl Engine {
         summaries.into_values().collect()
     }
 
-    fn timeline(rows: &[&LogRow], max_buckets: usize) -> Vec<TimelineBucket> {
+    fn timeline(rows: &[&LogRow], max_buckets: usize) -> (Vec<TimelineBucket>, TimelineAnalytics) {
         let timestamps = rows
             .iter()
             .filter_map(|row| row.timestamp)
             .collect::<Vec<_>>();
         let (Some(first), Some(last)) = (timestamps.iter().min(), timestamps.iter().max()) else {
-            return Vec::new();
+            return (
+                Vec::new(),
+                TimelineAnalytics {
+                    untimestamped_rows: rows.len(),
+                    ..TimelineAnalytics::default()
+                },
+            );
         };
 
         let bucket_count = max_buckets.min(timestamps.len()).max(1);
         let total_ms = (*last - *first).num_milliseconds().max(1);
         let bucket_ms = (total_ms / bucket_count as i64).max(1);
+        struct BucketBuilder {
+            bucket: TimelineBucket,
+            sources: BTreeMap<SourceId, usize>,
+        }
+
         let mut buckets = (0..bucket_count)
             .map(|bucket| {
                 let start = *first + TimeDelta::milliseconds(bucket as i64 * bucket_ms);
-                TimelineBucket {
-                    start,
-                    end: start + TimeDelta::milliseconds(bucket_ms),
-                    total: 0,
-                    warn: 0,
-                    error: 0,
+                BucketBuilder {
+                    bucket: TimelineBucket {
+                        start,
+                        end: start + TimeDelta::milliseconds(bucket_ms),
+                        total: 0,
+                        warn: 0,
+                        error: 0,
+                        level_counts: LevelCounts::default(),
+                        source_count: 0,
+                        top_source_id: None,
+                        top_source_rows: 0,
+                    },
+                    sources: BTreeMap::new(),
                 }
             })
             .collect::<Vec<_>>();
@@ -434,19 +466,72 @@ impl Engine {
             };
             let offset = (timestamp - *first).num_milliseconds().max(0);
             let index = ((offset / bucket_ms) as usize).min(bucket_count - 1);
-            let bucket = &mut buckets[index];
+            let builder = &mut buckets[index];
+            let bucket = &mut builder.bucket;
             bucket.total += 1;
+            bucket.level_counts.record(row.level);
             match row.level {
                 Some(LogLevel::Warn) => bucket.warn += 1,
                 Some(LogLevel::Error | LogLevel::Fatal) => bucket.error += 1,
                 _ => {}
             }
+            *builder.sources.entry(row.source_id).or_default() += 1;
         }
 
-        buckets
+        let mut analytics = TimelineAnalytics {
+            timestamped_rows: timestamps.len(),
+            untimestamped_rows: rows.len().saturating_sub(timestamps.len()),
+            first_timestamp: Some(*first),
+            last_timestamp: Some(*last),
+            ..TimelineAnalytics::default()
+        };
+
+        let buckets = buckets
             .into_iter()
-            .filter(|bucket| bucket.total > 0)
-            .collect()
+            .filter_map(|mut builder| {
+                if builder.bucket.total == 0 {
+                    return None;
+                }
+                builder.bucket.source_count = builder.sources.len();
+                if let Some((source_id, rows)) =
+                    builder.sources.into_iter().max_by_key(|(_, rows)| *rows)
+                {
+                    builder.bucket.top_source_id = Some(source_id);
+                    builder.bucket.top_source_rows = rows;
+                }
+                Some(builder.bucket)
+            })
+            .collect::<Vec<_>>();
+
+        for (index, bucket) in buckets.iter().enumerate() {
+            analytics.error_rows += bucket.error;
+            analytics.warn_rows += bucket.warn;
+            if analytics
+                .peak_total_bucket
+                .map(|peak| bucket.total > buckets[peak].total)
+                .unwrap_or(true)
+            {
+                analytics.peak_total_bucket = Some(index);
+            }
+            if analytics
+                .peak_error_bucket
+                .map(|peak| bucket.error > buckets[peak].error)
+                .unwrap_or(true)
+                && bucket.error > 0
+            {
+                analytics.peak_error_bucket = Some(index);
+            }
+            if analytics
+                .peak_warn_bucket
+                .map(|peak| bucket.warn > buckets[peak].warn)
+                .unwrap_or(true)
+                && bucket.warn > 0
+            {
+                analytics.peak_warn_bucket = Some(index);
+            }
+        }
+
+        (buckets, analytics)
     }
 
     fn present_row(&self, row: &LogRow) -> RowPresentation {
@@ -814,6 +899,52 @@ mod tests {
         assert_eq!(snapshot.source_summaries.len(), 2);
         assert_eq!(snapshot.level_counts.warn, 1);
         assert!(!snapshot.timeline.is_empty());
+    }
+
+    #[test]
+    fn timeline_analytics_identifies_peaks_and_source_concentration() {
+        let mut engine = Engine::default();
+        engine.add_source(SourceId(1), "one.log");
+        engine.add_source(SourceId(2), "two.log");
+        engine.append_row(mk_row_with_source_time(
+            0,
+            SourceId(1),
+            "2026-05-21T10:00:00Z",
+            "INFO ok",
+            Some(LogLevel::Info),
+        ));
+        engine.append_row(mk_row_with_source_time(
+            1,
+            SourceId(1),
+            "2026-05-21T10:00:01Z",
+            "ERROR failed",
+            Some(LogLevel::Error),
+        ));
+        engine.append_row(mk_row_with_source_time(
+            2,
+            SourceId(2),
+            "2026-05-21T10:00:01Z",
+            "WARN slow",
+            Some(LogLevel::Warn),
+        ));
+        engine.append_row(mk_row(3, "untimestamped", Some(LogLevel::Info)));
+
+        let snapshot = engine.metadata_snapshot();
+
+        assert_eq!(snapshot.timeline_analytics.timestamped_rows, 3);
+        assert_eq!(snapshot.timeline_analytics.untimestamped_rows, 1);
+        assert_eq!(snapshot.timeline_analytics.error_rows, 1);
+        assert_eq!(snapshot.timeline_analytics.warn_rows, 1);
+        let peak = snapshot
+            .timeline_analytics
+            .peak_total_bucket
+            .expect("peak bucket");
+        assert!(snapshot.timeline[peak].total >= 1);
+        assert!(snapshot.timeline.iter().any(|bucket| {
+            bucket.source_count >= 1
+                && bucket.top_source_id.is_some()
+                && bucket.top_source_rows >= 1
+        }));
     }
 
     #[test]
