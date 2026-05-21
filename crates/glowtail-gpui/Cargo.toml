@@ -1,0 +1,11 @@
+[package]
+name = "glowtail-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+glowtail-core = { path = "../glowtail-core" }
+gpui.workspace = true

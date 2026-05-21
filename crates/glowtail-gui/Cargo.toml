@@ -1,0 +1,12 @@
+[package]
+name = "glowtail-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+eframe.workspace = true
+glowtail-core = { path = "../glowtail-core" }
+tokio.workspace = true

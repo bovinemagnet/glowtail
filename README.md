@@ -40,6 +40,31 @@ cargo run -p glowtail-cli -- tail samples/json.log --json --filter billing --no-
 
 Use `--json` to force JSON-lines parsing, `--plain` to force plain-text parsing, or omit both to use the composite parser. `--filter` performs a case-insensitive contains match against the raw log line, including JSON fields. `--level` keeps rows at or above the selected level.
 
+## Native GPU UI
+
+Phase 3 adds `glowtail-gui`, a native egui/wgpu desktop interface that uses the same `glowtail-core` viewport API as the terminal UI.
+
+```bash
+cargo run -p glowtail-gui -- samples/mixed.log
+cargo run -p glowtail-gui -- samples/json.log --json
+cargo run -p glowtail-gui -- samples/mixed.log --filter timeout --level warn
+cargo run -p glowtail-gui -- samples/mixed.log --session .glowtail-gui-session.json
+```
+
+The desktop UI includes live tailing, a source sidebar, virtualized log viewport, severity color bands, search highlights, stack folding, timeline/minimap strip, JSON field detail panel, saved filters, bookmarks, search navigation, and a command palette. Press Cmd/Ctrl+K or the Command button to open the palette.
+
+By default the GUI follows appended lines. Use `--no-follow` for a static desktop inspection, or `--from-start` to have the live tailer replay current file contents instead of preloading them. `--session`, `--use-filter`, and `--save-filter` work in the GUI as they do in the terminal commands.
+
+## GPUI Desktop UI
+
+`glowtail-gpui` is a second native desktop prototype built with the GPUI library from the Zed ecosystem. It uses the same `glowtail-core` viewport snapshots and renders GPUI components for the source sidebar, virtualized log list, severity bands, first-row JSON detail panel, and timeline.
+
+```bash
+cargo run -p glowtail-gpui -- samples/mixed.log
+cargo run -p glowtail-gpui -- samples/json.log --json
+cargo run -p glowtail-gpui -- samples/mixed.log --filter timeout --level warn
+```
+
 ## Following and Existing Content
 
 By default, commands follow files for appended lines. Add `--no-follow` for one-shot reads that exit after current content is processed.
@@ -89,6 +114,7 @@ make fmt       # cargo fmt --all
 make clippy    # cargo clippy --all-targets --all-features -- -D warnings
 make test      # cargo test
 make run-sample
+make run-gui
 ```
 
 For the optional large-viewport smoke benchmark:
