@@ -2,6 +2,7 @@ use crate::model::{LogLevel, LogRow, SourceId};
 use chrono::{DateTime, TimeDelta, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -74,33 +75,10 @@ impl FilterExpr {
 }
 
 /// Composition of the three CLI/UI filter inputs:
-///   - `saved_filter`: name of a session-stored filter to start from
+///   - `saved_filter`: optional starting filter (e.g. one looked up by name from the session)
 ///   - `level`: minimum severity (kept if at or above this level)
-///   - `contains`: case-insensitive substring filter
-///
-/// Returns `Ok(filter)` even when all three are `None` (the result is then
-/// [`FilterExpr::All`]). Returns `Err(saved_filter)` when a saved-filter name
-/// is given but not present in the session, so callers can render an error.
-pub fn compose_filter(
-    saved_filter: Option<&crate::filter::FilterExpr>,
-    level: Option<LogLevel>,
-    contains: Option<&str>,
-) -> FilterExpr {
-    let mut parts = Vec::new();
-    if let Some(filter) = saved_filter {
-        parts.push(filter.clone());
-    }
-    if let Some(level) = level {
-        parts.push(FilterExpr::LevelAtLeast(level));
-    }
-    if let Some(text) = contains
-        && !text.is_empty()
-    {
-        parts.push(FilterExpr::Contains(text.to_owned()));
-    }
-    FilterExpr::and_all(parts)
-}
-
+///   - `filter_text`: free-form filter — either a query (`level = error`, `service = "billing"`)
+///     or a bare substring that falls through to a case-insensitive `contains`.
 pub fn compose_query_filter(
     saved_filter: Option<&crate::filter::FilterExpr>,
     level: Option<LogLevel>,
@@ -177,15 +155,15 @@ impl CompiledFilter {
             Self::All => true,
             Self::LevelAtLeast(min) => row.level.map(|level| level >= *min).unwrap_or(false),
             Self::LevelEquals(level) => row.level == Some(*level),
-            Self::Contains(needle) => row.raw.to_ascii_lowercase().contains(needle),
-            Self::MessageContains(needle) => row.message.to_ascii_lowercase().contains(needle),
+            Self::Contains(needle) => contains_ascii_ci(row.raw.as_ref(), needle),
+            Self::MessageContains(needle) => contains_ascii_ci(row.message.as_ref(), needle),
             Self::Regex(regex) => regex.is_match(row.raw.as_ref()),
             Self::Source(source_id) => row.source_id == *source_id,
             Self::FieldEquals { field, value } => row_field(row, field)
-                .map(|actual| actual == value.as_str())
+                .map(|actual| actual.as_ref() == value.as_str())
                 .unwrap_or(false),
             Self::FieldContains { field, value } => row_field(row, field)
-                .map(|actual| actual.to_ascii_lowercase().contains(value))
+                .map(|actual| contains_ascii_ci(actual.as_ref(), value))
                 .unwrap_or(false),
             Self::TimestampBetween { start, end } => row
                 .timestamp
@@ -217,20 +195,59 @@ pub fn parse_filter_query(input: &str) -> Result<FilterExpr, FilterError> {
     Ok(expr)
 }
 
-fn row_field(row: &LogRow, field: &str) -> Option<String> {
-    match normalize_field(field).as_str() {
-        "message" => Some(row.message.to_string()),
-        "raw" => Some(row.raw.to_string()),
-        "level" => row.level.map(|level| format!("{level:?}")),
-        "source" | "source_id" => Some(row.source_id.0.to_string()),
-        "timestamp" => row.timestamp.map(|timestamp| timestamp.to_rfc3339()),
+/// Looks up the value of `field` on `row` for a `FilterExpr::Field*` match.
+/// `field` is assumed to already be normalised via [`normalize_field`] at
+/// `CompiledFilter::compile` time, so this is allocation-free on the hot path
+/// for borrowable fields.
+fn row_field<'a>(row: &'a LogRow, field: &str) -> Option<Cow<'a, str>> {
+    match field {
+        "message" => Some(Cow::Borrowed(row.message.as_ref())),
+        "raw" => Some(Cow::Borrowed(row.raw.as_ref())),
+        "level" => row.level.map(|level| Cow::Borrowed(level_name(level))),
+        "source" | "source_id" => Some(Cow::Owned(row.source_id.0.to_string())),
+        "timestamp" => row
+            .timestamp
+            .map(|timestamp| Cow::Owned(timestamp.to_rfc3339())),
         field => row
             .fields
             .0
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(field))
-            .map(|(_, value)| value.to_string()),
+            .map(|(_, value)| Cow::Borrowed(value.as_ref())),
     }
+}
+
+fn level_name(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Trace => "trace",
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+        LogLevel::Fatal => "fatal",
+    }
+}
+
+/// Case-insensitive ASCII substring search without allocating either side.
+/// `needle` is assumed to already be lowercased.
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    'outer: for start in 0..=haystack.len() - needle.len() {
+        for (offset, byte) in needle.iter().enumerate() {
+            if haystack[start + offset].to_ascii_lowercase() != *byte {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn normalize_field(field: &str) -> String {
@@ -589,11 +606,8 @@ fn field_in(field: &str, values: Vec<String>) -> Result<FilterExpr, FilterError>
     Ok(FilterExpr::Or(
         values
             .into_iter()
-            .map(|value| {
-                field_compare(field, Token::Eq, value)
-                    .expect("equality comparison is valid for all fields")
-            })
-            .collect(),
+            .map(|value| field_compare(field, Token::Eq, value))
+            .collect::<Result<_, _>>()?,
     ))
 }
 
@@ -846,5 +860,26 @@ mod tests {
     fn query_parser_reports_invalid_expressions() {
         let err = parse_filter_query("level =").unwrap_err();
         assert!(format!("{err}").contains("invalid query"));
+    }
+
+    #[test]
+    fn query_parser_propagates_errors_inside_in_set() {
+        // Previously panicked because field_in called .expect() on a
+        // potentially-failing field_compare for non-level fields.
+        let err = parse_filter_query("source in (1, foo)").unwrap_err();
+        assert!(format!("{err}").contains("invalid source id"));
+    }
+
+    #[test]
+    fn field_equals_level_matches_lowercase_value() {
+        // row_field returns lowercased level names so a programmatic
+        // FilterExpr::FieldEquals { field: "level", value: "error" } matches.
+        let row = mk_row("ERROR boom", Some(LogLevel::Error), SourceId(1));
+        let expr = FilterExpr::FieldEquals {
+            field: "level".into(),
+            value: "error".into(),
+        };
+        let compiled = CompiledFilter::compile(&expr).unwrap();
+        assert!(compiled.matches(&row));
     }
 }

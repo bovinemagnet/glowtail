@@ -682,19 +682,15 @@ fn timeline_panel(snapshot: &ViewportSnapshot) -> impl IntoElement {
 
     for bucket in &snapshot.timeline {
         let height = 12.0 + (bucket.total as f32 / max_total) * 52.0;
-        row = row.child(
-            div()
-                .flex_1()
-                .h(px(height))
-                .rounded_sm()
-                .bg(if bucket.error > 0 {
-                    rgb(0xdc4f4f)
-                } else if bucket.warn > 0 {
-                    rgb(0xd6a33d)
-                } else {
-                    rgb(0x4f9ee3)
-                }),
-        );
+        row = row.child(div().flex_1().h(px(height)).rounded_sm().bg(
+            if bucket.error_count() > 0 {
+                rgb(0xdc4f4f)
+            } else if bucket.warn_count() > 0 {
+                rgb(0xd6a33d)
+            } else {
+                rgb(0x4f9ee3)
+            },
+        ));
     }
 
     row.into_any()

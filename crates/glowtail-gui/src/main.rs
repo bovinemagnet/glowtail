@@ -281,12 +281,11 @@ impl GlowtailGui {
                     .changed();
 
                 if filter_changed {
-                    let filter = if self.filter_text.trim().is_empty() {
-                        Ok(FilterExpr::All)
-                    } else {
-                        parse_filter_query(&self.filter_text)
-                    };
-                    if let Err(err) = filter.and_then(|filter| self.engine.set_filter(filter)) {
+                    if self.filter_text.trim().is_empty() {
+                        self.engine.clear_filter();
+                    } else if let Err(err) = parse_filter_query(&self.filter_text)
+                        .and_then(|filter| self.engine.set_filter(filter))
+                    {
                         self.status_message = Some(format!("filter error: {err}"));
                     }
                 }
@@ -473,9 +472,9 @@ impl GlowtailGui {
                         egui::pos2(x0, rect.bottom() - height),
                         egui::pos2(x0 + width.max(1.0) - 1.0, rect.bottom()),
                     );
-                    let color = if bucket.error > 0 {
+                    let color = if bucket.error_count() > 0 {
                         egui::Color32::from_rgb(220, 70, 70)
-                    } else if bucket.warn > 0 {
+                    } else if bucket.warn_count() > 0 {
                         egui::Color32::from_rgb(230, 180, 70)
                     } else {
                         egui::Color32::from_rgb(90, 150, 220)

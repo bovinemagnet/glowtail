@@ -94,12 +94,22 @@ pub struct TimelineBucket {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub total: usize,
-    pub warn: usize,
-    pub error: usize,
     pub level_counts: LevelCounts,
     pub source_count: usize,
     pub top_source_id: Option<SourceId>,
     pub top_source_rows: usize,
+}
+
+impl TimelineBucket {
+    /// Convenience accessor: total of `Error` + `Fatal` rows in this bucket.
+    pub fn error_count(&self) -> usize {
+        self.level_counts.error + self.level_counts.fatal
+    }
+
+    /// Convenience accessor: total of `Warn` rows in this bucket.
+    pub fn warn_count(&self) -> usize {
+        self.level_counts.warn
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

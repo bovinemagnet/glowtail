@@ -400,16 +400,18 @@ impl Engine {
     fn source_summaries(&self, rows: &[&LogRow]) -> Vec<SourceSummary> {
         let mut summaries = BTreeMap::<SourceId, SourceSummary>::new();
         for row in rows {
-            let name = self
-                .sources
-                .get(&row.source_id)
-                .map(|source| source.name.clone())
-                .unwrap_or_else(|| Arc::from(format!("source-{}", row.source_id.0)));
-            let summary = summaries.entry(row.source_id).or_insert(SourceSummary {
-                source_id: row.source_id,
-                name,
-                rows: 0,
-                level_counts: LevelCounts::default(),
+            let summary = summaries.entry(row.source_id).or_insert_with(|| {
+                let name = self
+                    .sources
+                    .get(&row.source_id)
+                    .map(|source| source.name.clone())
+                    .unwrap_or_else(|| Arc::from(format!("source-{}", row.source_id.0)));
+                SourceSummary {
+                    source_id: row.source_id,
+                    name,
+                    rows: 0,
+                    level_counts: LevelCounts::default(),
+                }
             });
             summary.rows += 1;
             summary.level_counts.record(row.level);
@@ -418,11 +420,21 @@ impl Engine {
     }
 
     fn timeline(rows: &[&LogRow], max_buckets: usize) -> (Vec<TimelineBucket>, TimelineAnalytics) {
-        let timestamps = rows
-            .iter()
-            .filter_map(|row| row.timestamp)
-            .collect::<Vec<_>>();
-        let (Some(first), Some(last)) = (timestamps.iter().min(), timestamps.iter().max()) else {
+        let mut first = None;
+        let mut last = None;
+        let mut timestamped_rows = 0usize;
+        for row in rows {
+            if let Some(timestamp) = row.timestamp {
+                timestamped_rows += 1;
+                first = Some(first.map_or(timestamp, |f: chrono::DateTime<chrono::Utc>| {
+                    f.min(timestamp)
+                }));
+                last = Some(last.map_or(timestamp, |l: chrono::DateTime<chrono::Utc>| {
+                    l.max(timestamp)
+                }));
+            }
+        }
+        let (Some(first), Some(last)) = (first, last) else {
             return (
                 Vec::new(),
                 TimelineAnalytics {
@@ -432,8 +444,8 @@ impl Engine {
             );
         };
 
-        let bucket_count = max_buckets.min(timestamps.len()).max(1);
-        let total_ms = (*last - *first).num_milliseconds().max(1);
+        let bucket_count = max_buckets.min(timestamped_rows).max(1);
+        let total_ms = (last - first).num_milliseconds().max(1);
         let bucket_ms = (total_ms / bucket_count as i64).max(1);
         struct BucketBuilder {
             bucket: TimelineBucket,
@@ -442,14 +454,12 @@ impl Engine {
 
         let mut buckets = (0..bucket_count)
             .map(|bucket| {
-                let start = *first + TimeDelta::milliseconds(bucket as i64 * bucket_ms);
+                let start = first + TimeDelta::milliseconds(bucket as i64 * bucket_ms);
                 BucketBuilder {
                     bucket: TimelineBucket {
                         start,
                         end: start + TimeDelta::milliseconds(bucket_ms),
                         total: 0,
-                        warn: 0,
-                        error: 0,
                         level_counts: LevelCounts::default(),
                         source_count: 0,
                         top_source_id: None,
@@ -464,27 +474,13 @@ impl Engine {
             let Some(timestamp) = row.timestamp else {
                 continue;
             };
-            let offset = (timestamp - *first).num_milliseconds().max(0);
+            let offset = (timestamp - first).num_milliseconds().max(0);
             let index = ((offset / bucket_ms) as usize).min(bucket_count - 1);
             let builder = &mut buckets[index];
-            let bucket = &mut builder.bucket;
-            bucket.total += 1;
-            bucket.level_counts.record(row.level);
-            match row.level {
-                Some(LogLevel::Warn) => bucket.warn += 1,
-                Some(LogLevel::Error | LogLevel::Fatal) => bucket.error += 1,
-                _ => {}
-            }
+            builder.bucket.total += 1;
+            builder.bucket.level_counts.record(row.level);
             *builder.sources.entry(row.source_id).or_default() += 1;
         }
-
-        let mut analytics = TimelineAnalytics {
-            timestamped_rows: timestamps.len(),
-            untimestamped_rows: rows.len().saturating_sub(timestamps.len()),
-            first_timestamp: Some(*first),
-            last_timestamp: Some(*last),
-            ..TimelineAnalytics::default()
-        };
 
         let buckets = buckets
             .into_iter()
@@ -503,33 +499,28 @@ impl Engine {
             })
             .collect::<Vec<_>>();
 
+        let mut analytics = TimelineAnalytics {
+            timestamped_rows,
+            untimestamped_rows: rows.len().saturating_sub(timestamped_rows),
+            first_timestamp: Some(first),
+            last_timestamp: Some(last),
+            ..TimelineAnalytics::default()
+        };
+        let mut peak_total = None;
+        let mut peak_error = None;
+        let mut peak_warn = None;
         for (index, bucket) in buckets.iter().enumerate() {
-            analytics.error_rows += bucket.error;
-            analytics.warn_rows += bucket.warn;
-            if analytics
-                .peak_total_bucket
-                .map(|peak| bucket.total > buckets[peak].total)
-                .unwrap_or(true)
-            {
-                analytics.peak_total_bucket = Some(index);
-            }
-            if analytics
-                .peak_error_bucket
-                .map(|peak| bucket.error > buckets[peak].error)
-                .unwrap_or(true)
-                && bucket.error > 0
-            {
-                analytics.peak_error_bucket = Some(index);
-            }
-            if analytics
-                .peak_warn_bucket
-                .map(|peak| bucket.warn > buckets[peak].warn)
-                .unwrap_or(true)
-                && bucket.warn > 0
-            {
-                analytics.peak_warn_bucket = Some(index);
-            }
+            let errors = bucket.error_count();
+            let warns = bucket.warn_count();
+            analytics.error_rows += errors;
+            analytics.warn_rows += warns;
+            update_peak(&mut peak_total, index, bucket.total, true);
+            update_peak(&mut peak_error, index, errors, false);
+            update_peak(&mut peak_warn, index, warns, false);
         }
+        analytics.peak_total_bucket = peak_total.map(|(index, _)| index);
+        analytics.peak_error_bucket = peak_error.map(|(index, _)| index);
+        analytics.peak_warn_bucket = peak_warn.map(|(index, _)| index);
 
         (buckets, analytics)
     }
@@ -686,6 +677,18 @@ impl Engine {
             || raw.starts_with("at ")
             || raw.starts_with("Caused by:")
             || raw.starts_with("... ")
+    }
+}
+
+/// Track the index of the bucket with the highest `value`. When `allow_zero`
+/// is false the slot is left untouched for empty buckets, so peaks for
+/// "any warn/error" stay `None` rather than pointing at the first bucket.
+fn update_peak(peak: &mut Option<(usize, usize)>, index: usize, value: usize, allow_zero: bool) {
+    if value == 0 && !allow_zero {
+        return;
+    }
+    if peak.is_none_or(|(_, current)| value > current) {
+        *peak = Some((index, value));
     }
 }
 
