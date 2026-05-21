@@ -4,5 +4,6 @@ pub mod filter;
 pub mod index;
 pub mod model;
 pub mod parser;
+pub mod session;
 pub mod source;
 pub mod viewport;

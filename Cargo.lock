@@ -385,6 +385,7 @@ dependencies = [
  "crossterm",
  "glowtail-core",
  "ratatui",
+ "tokio",
 ]
 
 [[package]]

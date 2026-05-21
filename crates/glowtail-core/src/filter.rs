@@ -1,7 +1,8 @@
 use crate::model::{LogLevel, LogRow, SourceId};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FilterExpr {
     #[default]
     All,
@@ -27,6 +28,21 @@ pub enum CompiledFilter {
     And(Vec<CompiledFilter>),
     Or(Vec<CompiledFilter>),
     Not(Box<CompiledFilter>),
+}
+
+impl FilterExpr {
+    pub fn and_all(filters: impl IntoIterator<Item = FilterExpr>) -> Self {
+        let filters = filters
+            .into_iter()
+            .filter(|filter| !matches!(filter, FilterExpr::All))
+            .collect::<Vec<_>>();
+
+        match filters.len() {
+            0 => FilterExpr::All,
+            1 => filters.into_iter().next().expect("one filter exists"),
+            _ => FilterExpr::And(filters),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,8 +85,8 @@ impl CompiledFilter {
             Self::All => true,
             Self::LevelAtLeast(min) => row.level.map(|level| level >= *min).unwrap_or(false),
             Self::LevelEquals(level) => row.level == Some(*level),
-            Self::Contains(needle) => row.message.to_ascii_lowercase().contains(needle),
-            Self::Regex(regex) => regex.is_match(row.message.as_ref()),
+            Self::Contains(needle) => row.raw.to_ascii_lowercase().contains(needle),
+            Self::Regex(regex) => regex.is_match(row.raw.as_ref()),
             Self::Source(source_id) => row.source_id == *source_id,
             Self::And(items) => items.iter().all(|f| f.matches(row)),
             Self::Or(items) => items.iter().any(|f| f.matches(row)),
@@ -109,6 +125,17 @@ mod tests {
     }
 
     #[test]
+    fn contains_matches_raw_json_fields() {
+        let row = mk_row(
+            r#"{"message":"started","service":"billing"}"#,
+            Some(LogLevel::Info),
+            SourceId(1),
+        );
+        let compiled = CompiledFilter::compile(&FilterExpr::Contains("billing".into())).unwrap();
+        assert!(compiled.matches(&row));
+    }
+
+    #[test]
     fn regex_compile_reports_errors() {
         let err = CompiledFilter::compile(&FilterExpr::Regex("(".into())).unwrap_err();
         assert!(format!("{err}").contains("invalid regex"));
@@ -124,5 +151,32 @@ mod tests {
         ]);
         let compiled = CompiledFilter::compile(&expr).unwrap();
         assert!(compiled.matches(&row));
+    }
+
+    #[test]
+    fn level_equals_regex_or_and_not_filters_work() {
+        let error = mk_row("ERROR timeout", Some(LogLevel::Error), SourceId(1));
+        let info = mk_row("INFO started", Some(LogLevel::Info), SourceId(2));
+
+        let equals = CompiledFilter::compile(&FilterExpr::LevelEquals(LogLevel::Error)).unwrap();
+        assert!(equals.matches(&error));
+        assert!(!equals.matches(&info));
+
+        let regex = CompiledFilter::compile(&FilterExpr::Regex("time(out)?".into())).unwrap();
+        assert!(regex.matches(&error));
+
+        let source_or_not = CompiledFilter::compile(&FilterExpr::Or(vec![
+            FilterExpr::Source(SourceId(2)),
+            FilterExpr::Not(Box::new(FilterExpr::Contains("started".into()))),
+        ]))
+        .unwrap();
+        assert!(source_or_not.matches(&error));
+        assert!(source_or_not.matches(&info));
+    }
+
+    #[test]
+    fn and_all_omits_all_filters() {
+        let expr = FilterExpr::and_all([FilterExpr::All, FilterExpr::Contains("db".into())]);
+        assert_eq!(expr, FilterExpr::Contains("db".into()));
     }
 }

@@ -8,6 +8,7 @@ pub fn render(
     frame: &mut Frame,
     snapshot: &ViewportSnapshot,
     follow: bool,
+    fold_stacks: bool,
     input_mode: &impl std::fmt::Debug,
     input: &str,
 ) {
@@ -20,9 +21,21 @@ pub fn render(
         ])
         .split(frame.area());
 
+    let sources = snapshot
+        .source_summaries
+        .iter()
+        .map(|source| format!("{}:{}", source.name, source.rows))
+        .collect::<Vec<_>>()
+        .join(" ");
     let status = Paragraph::new(format!(
-        "rows={} follow={} mode={input_mode:?}",
-        snapshot.total_matching_rows, follow
+        "rows={}/{} warn={} err={} follow={} fold={} timeline={} mode={input_mode:?} {sources}",
+        snapshot.total_matching_rows,
+        snapshot.total_rows,
+        snapshot.level_counts.warn,
+        snapshot.level_counts.error + snapshot.level_counts.fatal,
+        follow,
+        fold_stacks,
+        snapshot.timeline.len()
     ));
     frame.render_widget(status, layout[0]);
 
@@ -30,20 +43,41 @@ pub fn render(
         .rows
         .iter()
         .map(|row| {
-            let spans = row
-                .spans
-                .iter()
-                .map(|span| {
-                    let style = match span.kind {
-                        SpanKind::Error => Style::default().fg(Color::Red),
-                        SpanKind::Warning => Style::default().fg(Color::Yellow),
-                        SpanKind::SearchMatch => Style::default().fg(Color::Black).bg(Color::Green),
-                        SpanKind::Timestamp => Style::default().fg(Color::Blue),
-                        _ => Style::default(),
-                    };
-                    Span::styled(span.text.to_string(), style)
-                })
-                .collect::<Vec<_>>();
+            let mut spans = Vec::new();
+            if row.is_bookmarked {
+                spans.push(Span::styled("* ", Style::default().fg(Color::Magenta)));
+            }
+            if row.folded_stack_rows > 0 {
+                spans.push(Span::styled(
+                    format!("+{} ", row.folded_stack_rows),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(source_name) = row.source_name.as_ref() {
+                spans.push(Span::styled(
+                    format!("[{source_name}] "),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans.extend(
+                row.spans
+                    .iter()
+                    .map(|span| {
+                        let style = match span.kind {
+                            SpanKind::Error => Style::default().fg(Color::Red),
+                            SpanKind::Warning => Style::default().fg(Color::Yellow),
+                            SpanKind::SearchMatch => {
+                                Style::default().fg(Color::Black).bg(Color::Green)
+                            }
+                            SpanKind::Timestamp => Style::default().fg(Color::Blue),
+                            SpanKind::JsonKey => Style::default().fg(Color::Cyan),
+                            SpanKind::JsonValue => Style::default().fg(Color::Green),
+                            _ => Style::default(),
+                        };
+                        Span::styled(span.text.to_string(), style)
+                    })
+                    .collect::<Vec<_>>(),
+            );
             Line::from(spans)
         })
         .collect();
@@ -53,7 +87,7 @@ pub fn render(
     frame.render_widget(viewport, layout[1]);
 
     let help = Paragraph::new(format!(
-        "q quit | j/k scroll | f follow | / search | F filter | Esc clear | input={input}"
+        "q quit | j/k scroll | f follow | b bookmark | z fold | / search | n/N next | F filter | Esc clear | input={input}"
     ));
     frame.render_widget(help, layout[2]);
 }

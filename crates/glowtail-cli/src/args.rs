@@ -12,6 +12,7 @@ pub struct Args {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     View {
+        #[arg(required = true)]
         paths: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -25,8 +26,15 @@ pub enum Command {
         no_follow: bool,
         #[arg(long)]
         from_start: bool,
+        #[arg(long)]
+        session: Option<PathBuf>,
+        #[arg(long)]
+        use_filter: Option<String>,
+        #[arg(long)]
+        save_filter: Option<String>,
     },
     Tail {
+        #[arg(required = true)]
         paths: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -40,6 +48,12 @@ pub enum Command {
         no_follow: bool,
         #[arg(long)]
         from_start: bool,
+        #[arg(long)]
+        session: Option<PathBuf>,
+        #[arg(long)]
+        use_filter: Option<String>,
+        #[arg(long)]
+        save_filter: Option<String>,
     },
 }
 

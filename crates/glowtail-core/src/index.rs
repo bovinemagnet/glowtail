@@ -2,6 +2,8 @@ use crate::model::{LogRow, RowId};
 
 #[derive(Debug, Default)]
 pub struct RowIndex {
+    // Phase 1 uses Vec-backed append-only storage. The API keeps storage
+    // replaceable by chunked rows, mmap offsets, or columnar metadata later.
     rows: Vec<LogRow>,
 }
 

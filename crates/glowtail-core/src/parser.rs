@@ -26,6 +26,12 @@ impl PlainTextParser {
         .find(|token| line.contains(**token))
         .and_then(|token| LogLevel::parse(token))
     }
+
+    fn parse_timestamp(line: &str) -> Option<DateTime<Utc>> {
+        line.split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<DateTime<Utc>>().ok())
+    }
 }
 
 impl LogParser for PlainTextParser {
@@ -45,7 +51,7 @@ impl LogParser for PlainTextParser {
             row_id,
             source_id,
             byte_range,
-            timestamp: None,
+            timestamp: Self::parse_timestamp(line),
             level: Self::detect_level(line),
             raw: raw.clone(),
             message: raw,
@@ -108,10 +114,20 @@ impl JsonLineParser {
                     }
                     continue;
                 }
-                fields.insert(Arc::<str>::from(k.clone()), Arc::<str>::from(v.to_string()));
+                fields.insert(
+                    Arc::<str>::from(k.clone()),
+                    Arc::<str>::from(Self::field_value(v)),
+                );
             }
         }
         fields
+    }
+
+    fn field_value(value: &Value) -> String {
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| value.to_string())
     }
 
     pub fn try_parse_line(
@@ -196,6 +212,19 @@ mod tests {
     }
 
     #[test]
+    fn plain_parser_extracts_rfc3339_timestamp() {
+        let parser = PlainTextParser;
+        let row = parser.parse_line(
+            SourceId(1),
+            RowId(1),
+            ByteRange { start: 0, end: 36 },
+            "2026-05-21T10:15:30Z INFO started",
+        );
+        assert!(row.timestamp.is_some());
+        assert_eq!(row.level, Some(LogLevel::Info));
+    }
+
+    #[test]
     fn json_parser_extracts_known_fields() {
         let parser = JsonLineParser;
         let line = r#"{"timestamp":"2026-05-21T10:15:30Z","level":"ERROR","message":"failed","service":"billing"}"#;
@@ -204,7 +233,7 @@ mod tests {
         assert_eq!(row.message.as_ref(), "failed");
         assert_eq!(
             row.fields.0.get("service").map(AsRef::as_ref),
-            Some("\"billing\"")
+            Some("billing")
         );
         assert!(row.timestamp.is_some());
     }

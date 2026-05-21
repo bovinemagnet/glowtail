@@ -1,12 +1,13 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RowId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +16,7 @@ pub struct ByteRange {
     pub end: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -44,6 +45,55 @@ pub enum LogSourceKind {
     File,
     Stdin,
     Other(Arc<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceInfo {
+    pub source_id: SourceId,
+    pub name: Arc<str>,
+    pub kind: LogSourceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LevelCounts {
+    pub trace: usize,
+    pub debug: usize,
+    pub info: usize,
+    pub warn: usize,
+    pub error: usize,
+    pub fatal: usize,
+    pub unknown: usize,
+}
+
+impl LevelCounts {
+    pub fn record(&mut self, level: Option<LogLevel>) {
+        match level {
+            Some(LogLevel::Trace) => self.trace += 1,
+            Some(LogLevel::Debug) => self.debug += 1,
+            Some(LogLevel::Info) => self.info += 1,
+            Some(LogLevel::Warn) => self.warn += 1,
+            Some(LogLevel::Error) => self.error += 1,
+            Some(LogLevel::Fatal) => self.fatal += 1,
+            None => self.unknown += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSummary {
+    pub source_id: SourceId,
+    pub name: Arc<str>,
+    pub rows: usize,
+    pub level_counts: LevelCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineBucket {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub total: usize,
+    pub warn: usize,
+    pub error: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -95,10 +145,15 @@ pub struct StyledSpan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowPresentation {
     pub row_id: RowId,
+    pub source_id: SourceId,
+    pub source_name: Option<Arc<str>>,
     pub spans: Vec<StyledSpan>,
     pub level: Option<LogLevel>,
     pub is_match: bool,
     pub is_selected: bool,
+    pub is_bookmarked: bool,
+    pub is_stack_continuation: bool,
+    pub folded_stack_rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,9 +165,13 @@ pub struct ViewportRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewportSnapshot {
     pub rows: Vec<RowPresentation>,
+    pub total_rows: usize,
     pub total_matching_rows: usize,
     pub has_more_before: bool,
     pub has_more_after: bool,
+    pub level_counts: LevelCounts,
+    pub source_summaries: Vec<SourceSummary>,
+    pub timeline: Vec<TimelineBucket>,
 }
 
 #[cfg(test)]
@@ -179,6 +238,8 @@ mod tests {
     fn model_represents_search_highlight_spans() {
         let presentation = RowPresentation {
             row_id: RowId(4),
+            source_id: SourceId(1),
+            source_name: None,
             spans: vec![
                 StyledSpan {
                     kind: SpanKind::Message,
@@ -194,6 +255,9 @@ mod tests {
             level: Some(LogLevel::Warn),
             is_match: true,
             is_selected: false,
+            is_bookmarked: false,
+            is_stack_continuation: false,
+            folded_stack_rows: 0,
         };
 
         assert!(
