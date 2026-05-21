@@ -41,6 +41,10 @@ fn viewport_returns_filtered_semantic_rows_without_ui_types() {
     assert_eq!(snapshot.rows[0].row_id.0, 40);
 }
 
+/// Catches *direct* UI dependencies in `glowtail-core/Cargo.toml`. A
+/// transitive UI dep (e.g. a future internal helper crate that re-exports
+/// ratatui types) would slip past this check; if the dep graph ever grows
+/// past the four UI crates, replace this with a `cargo metadata` walk.
 #[test]
 fn core_crate_has_no_ui_dependencies() {
     let manifest =

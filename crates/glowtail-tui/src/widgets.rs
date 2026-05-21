@@ -4,6 +4,13 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+/// Total number of terminal rows the chrome (status bar + help line + the two
+/// border rows of the viewport block) consumes. Exposed so `app.rs` can
+/// derive `visible_rows` from the terminal height without hard-coding the
+/// layout in two places.
+pub const CHROME_HEIGHT: usize = 4;
+
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     snapshot: &ViewportSnapshot,
@@ -11,6 +18,8 @@ pub fn render(
     fold_stacks: bool,
     input_mode: &impl std::fmt::Debug,
     input: &str,
+    selected_offset: usize,
+    status_message: Option<&str>,
 ) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -27,8 +36,11 @@ pub fn render(
         .map(|source| format!("{}:{}", source.name, source.rows))
         .collect::<Vec<_>>()
         .join(" ");
+    let status_extra = status_message
+        .map(|message| format!(" | {message}"))
+        .unwrap_or_default();
     let status = Paragraph::new(format!(
-        "rows={}/{} warn={} err={} follow={} fold={} timeline={} mode={input_mode:?} {sources}",
+        "rows={}/{} warn={} err={} follow={} fold={} timeline={} mode={input_mode:?} {sources}{status_extra}",
         snapshot.total_matching_rows,
         snapshot.total_rows,
         snapshot.level_counts.warn,
@@ -42,8 +54,14 @@ pub fn render(
     let lines: Vec<Line> = snapshot
         .rows
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let mut spans = Vec::new();
+            let cursor = if index == selected_offset { '>' } else { ' ' };
+            spans.push(Span::styled(
+                format!("{cursor} "),
+                Style::default().fg(Color::Yellow),
+            ));
             if row.is_bookmarked {
                 spans.push(Span::styled("* ", Style::default().fg(Color::Magenta)));
             }
@@ -78,7 +96,11 @@ pub fn render(
                     })
                     .collect::<Vec<_>>(),
             );
-            Line::from(spans)
+            let mut line = Line::from(spans);
+            if index == selected_offset {
+                line = line.style(Style::default().bg(Color::Rgb(40, 60, 80)));
+            }
+            line
         })
         .collect();
 
@@ -87,7 +109,7 @@ pub fn render(
     frame.render_widget(viewport, layout[1]);
 
     let help = Paragraph::new(format!(
-        "q quit | j/k scroll | f follow | b bookmark | z fold | / search | n/N next | F filter | Esc clear | input={input}"
+        "q quit | j/k select | f follow | b bookmark | z fold | / search | n/N next | F filter | Esc clear | input={input}"
     ));
     frame.render_widget(help, layout[2]);
 }

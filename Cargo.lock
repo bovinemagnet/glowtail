@@ -2864,6 +2864,7 @@ dependencies = [
  "clap",
  "glowtail-core",
  "gpui",
+ "tokio",
 ]
 
 [[package]]

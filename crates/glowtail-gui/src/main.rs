@@ -1,16 +1,8 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use eframe::egui;
-use glowtail_core::events::LogEvent;
-use glowtail_core::filter::FilterExpr;
-use glowtail_core::model::{
-    ByteRange, LogLevel, RowId, RowPresentation, SourceId, SpanKind, StyledSpan, ViewportRequest,
-    ViewportSnapshot,
-};
-use glowtail_core::parser::{CompositeParser, JsonLineParser, LogParser, PlainTextParser};
-use glowtail_core::session::InvestigationSession;
-use glowtail_core::source::FileTailer;
-use glowtail_core::viewport::Engine;
+use glowtail_core::filter::compose_filter;
+use glowtail_core::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
@@ -57,12 +49,19 @@ enum LevelArg {
 fn main() -> Result<()> {
     let args = Args::parse();
     let session = load_session(args.session.as_ref())?;
+    let parser = parser_from_flags(args.json, args.plain);
     let mut engine = if !args.no_follow && args.from_start {
         Engine::with_session(session)
     } else {
-        load_engine(&args, session)?
+        let mut engine = Engine::with_session(session);
+        for path in &args.paths {
+            engine
+                .load_file(path, parser.as_ref())
+                .with_context(|| format!("failed to read {}", path.display()))?;
+        }
+        engine
     };
-    configure_filter(
+    apply_filters(
         &mut engine,
         args.filter.clone(),
         args.level,
@@ -81,7 +80,7 @@ fn main() -> Result<()> {
         Some(start_tailers(
             &runtime,
             &args.paths,
-            parser_from_flags(args.json, args.plain),
+            Arc::clone(&parser),
             args.from_start,
         ))
     };
@@ -110,35 +109,6 @@ fn main() -> Result<()> {
     .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
-fn load_engine(args: &Args, session: InvestigationSession) -> Result<Engine> {
-    let parser = parser_from_flags(args.json, args.plain);
-    let mut engine = Engine::with_session(session);
-    let mut source_counter = 0u64;
-
-    for path in &args.paths {
-        source_counter += 1;
-        let source_id = SourceId(source_counter);
-        engine.add_source(source_id, path.display().to_string());
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-
-        let mut offset = 0u64;
-        for line in content.lines() {
-            let end = offset + line.len() as u64 + 1;
-            let row = parser.parse_line(
-                source_id,
-                RowId(engine.total_rows() as u64),
-                ByteRange { start: offset, end },
-                line,
-            );
-            engine.append_row(row);
-            offset = end;
-        }
-    }
-
-    Ok(engine)
-}
-
 fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
     if json {
         Arc::new(JsonLineParser)
@@ -149,27 +119,25 @@ fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
     }
 }
 
-fn configure_filter(
+fn apply_filters(
     engine: &mut Engine,
     filter_text: Option<String>,
     level: Option<LevelArg>,
     use_filter: Option<String>,
     save_filter: Option<String>,
 ) -> Result<()> {
-    let mut filters = Vec::new();
-    if let Some(name) = use_filter {
-        let Some(filter) = engine.session().saved_filter(&name).cloned() else {
-            bail!("saved filter not found: {name}");
-        };
-        filters.push(filter);
-    }
-    if let Some(level) = level {
-        filters.push(FilterExpr::LevelAtLeast(level.into()));
-    }
-    if let Some(filter_text) = filter_text {
-        filters.push(FilterExpr::Contains(filter_text));
-    }
-    engine.set_filter(FilterExpr::and_all(filters))?;
+    let saved = use_filter
+        .map(|name| {
+            engine
+                .session()
+                .saved_filter(&name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("saved filter not found: {name}"))
+        })
+        .transpose()?;
+    let level: Option<LogLevel> = level.map(Into::into);
+    let filter = compose_filter(saved.as_ref(), level, filter_text.as_deref());
+    engine.set_filter(filter)?;
     if let Some(name) = save_filter {
         engine.save_filter(name);
     }
@@ -317,14 +285,16 @@ impl GlowtailGui {
                     } else {
                         FilterExpr::Contains(self.filter_text.clone())
                     };
-                    let _ = self.engine.set_filter(filter);
+                    if let Err(err) = self.engine.set_filter(filter) {
+                        self.status_message = Some(format!("filter error: {err}"));
+                    }
                 }
 
                 if search_changed {
                     self.engine.set_search_text(Some(self.search_text.clone()));
                 }
 
-                if ui.button("Command").clicked() {
+                if ui.button("Command (Cmd/Ctrl+K)").clicked() {
                     self.command_palette_open = true;
                 }
 
@@ -352,13 +322,13 @@ impl GlowtailGui {
                 if ui.button("Save").clicked() {
                     self.save_current_filter();
                 }
-                let names = self
+                let names: Vec<String> = self
                     .engine
                     .session()
                     .saved_filters
                     .iter()
-                    .map(|filter| filter.name.clone())
-                    .collect::<Vec<_>>();
+                    .map(|filter| filter.name.to_string())
+                    .collect();
                 for name in names {
                     if ui.button(&name).clicked() {
                         self.apply_saved_filter(&name);
@@ -436,7 +406,7 @@ impl GlowtailGui {
                 }
                 ui.separator();
 
-                let fields = json_field_pairs(&row.spans);
+                let fields = row.json_fields();
                 if fields.is_empty() {
                     ui.label("No structured JSON fields on this row.");
                 } else {
@@ -445,8 +415,8 @@ impl GlowtailGui {
                         .striped(true)
                         .show(ui, |ui| {
                             for (key, value) in fields {
-                                ui.monospace(key);
-                                ui.label(value);
+                                ui.monospace(key.as_ref());
+                                ui.label(value.as_ref());
                                 ui.end_row();
                             }
                         });
@@ -514,17 +484,17 @@ impl GlowtailGui {
             });
     }
 
-    fn log_viewport(&mut self, ctx: &egui::Context, snapshot: &ViewportSnapshot) {
+    fn log_viewport(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+            let total_matching_rows = self.engine.matching_rows_count();
             let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-            if self.follow && snapshot.total_matching_rows > 0 {
-                scroll =
-                    scroll.vertical_scroll_offset(snapshot.total_matching_rows as f32 * ROW_HEIGHT);
+            if self.follow && total_matching_rows > 0 {
+                scroll = scroll.vertical_scroll_offset(total_matching_rows as f32 * ROW_HEIGHT);
             } else if let Some(row) = self.scroll_to_row.take() {
                 scroll = scroll.vertical_scroll_offset(row as f32 * ROW_HEIGHT);
             }
-            scroll.show_rows(ui, ROW_HEIGHT, snapshot.total_matching_rows, |ui, range| {
+            scroll.show_rows(ui, ROW_HEIGHT, total_matching_rows, |ui, range| {
                 let page = self.engine.viewport(ViewportRequest {
                     first_row: range.start,
                     row_count: range.end.saturating_sub(range.start),
@@ -546,7 +516,7 @@ impl GlowtailGui {
             self.selected_row = Some(row.clone());
         }
 
-        let color = severity_color(row.level);
+        let color = severity_color(row.severity_role());
         let painter = ui.painter_at(rect);
         if is_selected {
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(40, 60, 80));
@@ -820,17 +790,17 @@ impl GlowtailGui {
 
 impl eframe::App for GlowtailGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain incoming events first so the follow-mode scroll target below
+        // is computed against the up-to-date row count, not the previous
+        // frame's stale total.
         self.drain_live_events();
         self.keyboard_shortcuts(ctx);
-        let snapshot = self.engine.viewport(ViewportRequest {
-            first_row: 0,
-            row_count: 1,
-        });
+        let metadata = self.engine.metadata_snapshot();
         self.top_bar(ctx);
-        self.source_sidebar(ctx, &snapshot);
+        self.source_sidebar(ctx, &metadata);
         self.detail_panel(ctx);
-        self.timeline_panel(ctx, &snapshot);
-        self.log_viewport(ctx, &snapshot);
+        self.timeline_panel(ctx, &metadata);
+        self.log_viewport(ctx);
         self.command_palette(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -905,29 +875,12 @@ fn span_color(span: &StyledSpan) -> egui::Color32 {
     }
 }
 
-fn severity_color(level: Option<LogLevel>) -> egui::Color32 {
-    match level {
-        Some(LogLevel::Fatal | LogLevel::Error) => egui::Color32::from_rgb(220, 70, 70),
-        Some(LogLevel::Warn) => egui::Color32::from_rgb(230, 180, 70),
-        Some(LogLevel::Info) => egui::Color32::from_rgb(80, 150, 220),
-        Some(LogLevel::Debug | LogLevel::Trace) => egui::Color32::from_rgb(120, 120, 160),
-        None => egui::Color32::from_gray(70),
+fn severity_color(role: SeverityRole) -> egui::Color32 {
+    match role {
+        SeverityRole::Fatal | SeverityRole::Error => egui::Color32::from_rgb(220, 70, 70),
+        SeverityRole::Warn => egui::Color32::from_rgb(230, 180, 70),
+        SeverityRole::Info => egui::Color32::from_rgb(80, 150, 220),
+        SeverityRole::Debug | SeverityRole::Trace => egui::Color32::from_rgb(120, 120, 160),
+        SeverityRole::Unknown => egui::Color32::from_gray(70),
     }
-}
-
-fn json_field_pairs(spans: &[StyledSpan]) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    let mut pending_key = None::<String>;
-    for span in spans {
-        match span.kind {
-            SpanKind::JsonKey => pending_key = Some(span.text.to_string()),
-            SpanKind::JsonValue => {
-                if let Some(key) = pending_key.take() {
-                    fields.push((key, span.text.to_string()));
-                }
-            }
-            _ => {}
-        }
-    }
-    fields
 }

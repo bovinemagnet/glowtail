@@ -1,15 +1,9 @@
 mod args;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use args::{Args, Command, LevelArg};
 use clap::Parser;
-use glowtail_core::events::LogEvent;
-use glowtail_core::filter::{CompiledFilter, FilterExpr};
-use glowtail_core::model::{ByteRange, LogLevel, RowId, SourceId};
-use glowtail_core::parser::{CompositeParser, JsonLineParser, LogParser, PlainTextParser};
-use glowtail_core::session::InvestigationSession;
-use glowtail_core::source::FileTailer;
-use glowtail_core::viewport::Engine;
+use glowtail_core::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -25,7 +19,7 @@ async fn main() -> Result<()> {
             filter,
             level,
             no_follow,
-            from_start: _from_start,
+            from_start,
             session,
             use_filter,
             save_filter,
@@ -36,6 +30,7 @@ async fn main() -> Result<()> {
                 filter_text: filter,
                 level,
                 follow: !no_follow,
+                from_start,
                 session,
                 use_filter,
                 save_filter,
@@ -60,11 +55,15 @@ async fn main() -> Result<()> {
             let mut engine = if follow && from_start {
                 Engine::with_session(investigation)
             } else {
-                load_initial_engine(paths.clone(), Arc::clone(&parser), investigation)
-                    .await
-                    .context("failed to load logs")?
+                load_initial_engine(paths.clone(), Arc::clone(&parser), investigation).await?
             };
-            configure_filters(&mut engine, filter, level, use_filter, save_filter)?;
+            apply_filters_and_save(
+                &mut engine,
+                &filter,
+                level,
+                use_filter.as_deref(),
+                save_filter,
+            )?;
 
             let engine = if follow {
                 let (tx, rx) = mpsc::channel(1024);
@@ -114,30 +113,14 @@ async fn load_initial_engine(
     session: InvestigationSession,
 ) -> Result<Engine> {
     let mut engine = Engine::with_session(session);
-    let mut source_counter = 0u64;
-
     for path in paths {
-        source_counter += 1;
-        let source_id = SourceId(source_counter);
+        let source_id = engine.next_source_id();
         engine.add_source(source_id, path.display().to_string());
-        let content = tokio::fs::read_to_string(&path)
+        let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
-
-        let mut offset = 0u64;
-        for line in content.lines() {
-            let end = offset + line.len() as u64 + 1;
-            let row = parser.parse_line(
-                source_id,
-                RowId(engine.total_rows() as u64),
-                ByteRange { start: offset, end },
-                line,
-            );
-            engine.append_row(row);
-            offset = end;
-        }
+        engine.ingest_bytes(source_id, parser.as_ref(), &bytes);
     }
-
     Ok(engine)
 }
 
@@ -147,12 +130,20 @@ struct TailRun {
     filter_text: Option<String>,
     level: Option<LevelArg>,
     follow: bool,
+    from_start: bool,
     session: Option<PathBuf>,
     use_filter: Option<String>,
     save_filter: Option<String>,
 }
 
 async fn run_tail(options: TailRun) -> Result<()> {
+    if !options.follow {
+        return run_tail_no_follow(options).await;
+    }
+    run_tail_follow(options).await
+}
+
+async fn run_tail_follow(options: TailRun) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(1024);
     let mut tailers = Vec::new();
     let source_count = options.paths.len();
@@ -163,22 +154,22 @@ async fn run_tail(options: TailRun) -> Result<()> {
             path,
             Arc::clone(&options.parser),
             tx.clone(),
+            options.from_start,
             true,
-            options.follow,
         ));
     }
     drop(tx);
 
     let investigation = load_session(options.session.as_ref())?;
     let mut engine = Engine::with_session(investigation);
-    let filter_expr = configure_filters(
+    let filter_expr = apply_filters_and_save(
         &mut engine,
-        options.filter_text,
+        &options.filter_text,
         options.level,
-        options.use_filter,
+        options.use_filter.as_deref(),
         options.save_filter,
     )?;
-    let compiled_filter = CompiledFilter::compile(&filter_expr)?;
+    let compiled_filter = glowtail_core::filter::CompiledFilter::compile(&filter_expr)?;
     let mut removed_sources = 0usize;
 
     while let Some(event) = rx.recv().await {
@@ -191,7 +182,7 @@ async fn run_tail(options: TailRun) -> Result<()> {
                     println!("{raw}");
                 }
             }
-            LogEvent::SourceRemoved { .. } if !options.follow => {
+            LogEvent::SourceRemoved { .. } => {
                 removed_sources += 1;
                 if removed_sources >= source_count {
                     break;
@@ -210,45 +201,52 @@ async fn run_tail(options: TailRun) -> Result<()> {
     Ok(())
 }
 
-fn configure_filters(
+async fn run_tail_no_follow(options: TailRun) -> Result<()> {
+    let investigation = load_session(options.session.as_ref())?;
+    let mut engine =
+        load_initial_engine(options.paths, Arc::clone(&options.parser), investigation).await?;
+    let filter_expr = apply_filters_and_save(
+        &mut engine,
+        &options.filter_text,
+        options.level,
+        options.use_filter.as_deref(),
+        options.save_filter,
+    )?;
+    let compiled_filter = glowtail_core::filter::CompiledFilter::compile(&filter_expr)?;
+
+    for row in engine.rows_snapshot() {
+        if compiled_filter.matches(row) {
+            println!("{}", row.raw);
+        }
+    }
+
+    save_session(options.session.as_ref(), engine.into_session())?;
+    Ok(())
+}
+
+fn apply_filters_and_save(
     engine: &mut Engine,
-    filter_text: Option<String>,
+    filter_text: &Option<String>,
     level: Option<LevelArg>,
-    use_filter: Option<String>,
+    use_filter: Option<&str>,
     save_filter: Option<String>,
 ) -> Result<FilterExpr> {
-    let filter = filter_expr_from_args(engine, filter_text, level, use_filter)?;
+    let saved = use_filter
+        .map(|name| {
+            engine
+                .session()
+                .saved_filter(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("saved filter not found: {name}"))
+        })
+        .transpose()?;
+    let level: Option<LogLevel> = level.map(Into::into);
+    let filter = compose_filter(saved.as_ref(), level, filter_text.as_deref());
     engine.set_filter(filter.clone())?;
     if let Some(name) = save_filter {
         engine.save_filter(name);
     }
     Ok(filter)
-}
-
-fn filter_expr_from_args(
-    engine: &Engine,
-    filter_text: Option<String>,
-    level: Option<LevelArg>,
-    use_filter: Option<String>,
-) -> Result<FilterExpr> {
-    let mut filters = Vec::new();
-
-    if let Some(name) = use_filter {
-        let Some(filter) = engine.session().saved_filter(&name).cloned() else {
-            bail!("saved filter not found: {name}");
-        };
-        filters.push(filter);
-    }
-
-    if let Some(level) = level {
-        filters.push(FilterExpr::LevelAtLeast(level.into()));
-    }
-
-    if let Some(text) = filter_text {
-        filters.push(FilterExpr::Contains(text));
-    }
-
-    Ok(FilterExpr::and_all(filters))
 }
 
 fn load_session(path: Option<&PathBuf>) -> Result<InvestigationSession> {

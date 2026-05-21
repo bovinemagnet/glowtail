@@ -63,7 +63,11 @@ By default the GUI follows appended lines. Use `--no-follow` for a static deskto
 cargo run -p glowtail-gpui -- samples/mixed.log
 cargo run -p glowtail-gpui -- samples/json.log --json
 cargo run -p glowtail-gpui -- samples/mixed.log --filter timeout --level warn
+cargo run -p glowtail-gpui -- samples/mixed.log --from-start
+cargo run -p glowtail-gpui -- samples/mixed.log --no-follow
 ```
+
+By default the GPUI app follows appended lines through the shared `glowtail-core` tailer. Use `--no-follow` for a static preload, or `--from-start` to have the live tailer replay existing file contents before following new lines.
 
 ## Following and Existing Content
 

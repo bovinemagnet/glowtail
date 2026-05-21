@@ -1,21 +1,22 @@
 use anyhow::{Context as AnyhowContext, Result};
 use clap::{Parser, ValueEnum};
-use glowtail_core::filter::FilterExpr;
-use glowtail_core::model::{
-    ByteRange, LogLevel, RowId, RowPresentation, SourceId, SpanKind, ViewportRequest,
-    ViewportSnapshot,
-};
-use glowtail_core::parser::{CompositeParser, JsonLineParser, LogParser, PlainTextParser};
-use glowtail_core::viewport::Engine;
+use glowtail_core::filter::compose_filter;
+use glowtail_core::prelude::*;
 use gpui::{
     App, Application, Bounds, Context, IntoElement, ListAlignment, ListState, ParentElement,
     Render, SharedString, Styled, Window, WindowBounds, WindowOptions, div, list, prelude::*, px,
     rgb, size,
 };
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::mpsc;
 
 const ROW_OVERDRAW: f32 = 640.0;
+const LIVE_REFRESH_MS: u64 = 100;
 
 #[derive(Debug, Parser)]
 #[command(name = "glowtail-gpui")]
@@ -31,6 +32,16 @@ struct Args {
     filter: Option<String>,
     #[arg(long)]
     level: Option<LevelArg>,
+    #[arg(long)]
+    no_follow: bool,
+    #[arg(long)]
+    from_start: bool,
+    #[arg(long)]
+    session: Option<PathBuf>,
+    #[arg(long)]
+    use_filter: Option<String>,
+    #[arg(long)]
+    save_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -45,59 +56,97 @@ enum LevelArg {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut engine = load_engine(&args)?;
-    configure_filter(&mut engine, args.filter, args.level)?;
+    let parser = parser_from_flags(args.json, args.plain);
+    let session = load_session(args.session.as_ref())?;
+    let mut engine = Engine::with_session(session);
+    if args.no_follow || !args.from_start {
+        for path in &args.paths {
+            engine
+                .load_file(path, parser.as_ref())
+                .with_context(|| format!("failed to read {}", path.display()))?;
+        }
+    }
+    apply_filters(
+        &mut engine,
+        args.filter.clone(),
+        args.level,
+        args.use_filter,
+        args.save_filter,
+    )?;
 
-    let snapshot = engine.viewport(ViewportRequest {
-        first_row: 0,
-        row_count: engine.matching_rows_count(),
-    });
-    let app = GlowtailGpui::new(snapshot);
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("glowtail-gpui-tail")
+        .build()
+        .context("failed to create async runtime")?;
+    let live_tail = if args.no_follow {
+        None
+    } else {
+        Some(start_tailers(
+            &runtime,
+            &args.paths,
+            Arc::clone(&parser),
+            args.from_start,
+        ))
+    };
+    let app = GlowtailGpui::new(engine, runtime, live_tail, args.session);
 
+    let launch_error: Arc<std::sync::Mutex<Option<anyhow::Error>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let launch_error_clone = Arc::clone(&launch_error);
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
-        cx.open_window(
+        let result = cx.open_window(
             WindowOptions {
                 focus: true,
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| app),
-        )
-        .expect("failed to open GPUI window");
+            move |_, cx| {
+                cx.new(move |cx| {
+                    app.start_refresh_loop(cx);
+                    app
+                })
+            },
+        );
+        if let Err(err) = result {
+            *launch_error_clone.lock().unwrap() =
+                Some(anyhow::anyhow!("failed to open GPUI window: {err}"));
+            return;
+        }
         cx.activate(true);
     });
 
+    if let Some(err) = launch_error.lock().unwrap().take() {
+        return Err(err);
+    }
     Ok(())
 }
 
-fn load_engine(args: &Args) -> Result<Engine> {
-    let parser = parser_from_flags(args.json, args.plain);
-    let mut engine = Engine::default();
-    let mut source_counter = 0u64;
-
-    for path in &args.paths {
-        source_counter += 1;
-        let source_id = SourceId(source_counter);
-        engine.add_source(source_id, path.display().to_string());
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-
-        let mut offset = 0u64;
-        for line in content.lines() {
-            let end = offset + line.len() as u64 + 1;
-            let row = parser.parse_line(
-                source_id,
-                RowId(engine.total_rows() as u64),
-                ByteRange { start: offset, end },
-                line,
-            );
-            engine.append_row(row);
-            offset = end;
-        }
+fn start_tailers(
+    runtime: &Runtime,
+    paths: &[PathBuf],
+    parser: Arc<dyn LogParser>,
+    from_start: bool,
+) -> LiveTail {
+    let (tx, rx) = mpsc::channel(1024);
+    let mut tailers = Vec::new();
+    let _guard = runtime.enter();
+    for (index, path) in paths.iter().enumerate() {
+        tailers.push(FileTailer::start(
+            SourceId((index + 1) as u64),
+            path.clone(),
+            Arc::clone(&parser),
+            tx.clone(),
+            from_start,
+            true,
+        ));
     }
-
-    Ok(engine)
+    drop(tx);
+    LiveTail {
+        receiver: rx,
+        tailers,
+    }
 }
 
 fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
@@ -110,20 +159,55 @@ fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
     }
 }
 
-fn configure_filter(
+fn apply_filters(
     engine: &mut Engine,
     filter_text: Option<String>,
     level: Option<LevelArg>,
+    use_filter: Option<String>,
+    save_filter: Option<String>,
 ) -> Result<()> {
-    let mut filters = Vec::new();
-    if let Some(level) = level {
-        filters.push(FilterExpr::LevelAtLeast(level.into()));
+    let saved = use_filter
+        .map(|name| {
+            engine
+                .session()
+                .saved_filter(&name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("saved filter not found: {name}"))
+        })
+        .transpose()?;
+    let level: Option<LogLevel> = level.map(Into::into);
+    let filter = compose_filter(saved.as_ref(), level, filter_text.as_deref());
+    engine.set_filter(filter)?;
+    if let Some(name) = save_filter {
+        engine.save_filter(name);
     }
-    if let Some(text) = filter_text {
-        filters.push(FilterExpr::Contains(text));
-    }
-    engine.set_filter(FilterExpr::and_all(filters))?;
     Ok(())
+}
+
+fn load_session(path: Option<&PathBuf>) -> Result<InvestigationSession> {
+    let Some(path) = path else {
+        return Ok(InvestigationSession::default());
+    };
+    if !path.exists() {
+        return Ok(InvestigationSession::default());
+    }
+    InvestigationSession::load_from_path(path)
+        .with_context(|| format!("failed to load session {}", path.display()))
+}
+
+fn save_session(path: Option<&PathBuf>, session: &InvestigationSession) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create session directory {}", parent.display()))?;
+    }
+    session
+        .save_to_path(path)
+        .with_context(|| format!("failed to save session {}", path.display()))
 }
 
 impl From<LevelArg> for LogLevel {
@@ -139,25 +223,147 @@ impl From<LevelArg> for LogLevel {
     }
 }
 
-#[derive(Clone)]
+struct LiveTail {
+    receiver: mpsc::Receiver<LogEvent>,
+    tailers: Vec<FileTailer>,
+}
+
 struct GlowtailGpui {
-    snapshot: Arc<ViewportSnapshot>,
+    /// Engine wrapped in `Rc<RefCell<_>>` so the per-row render closure can
+    /// borrow it mutably without us materialising every row up-front.
+    engine: Rc<RefCell<Engine>>,
+    metadata: Arc<ViewportSnapshot>,
     list_state: ListState,
+    runtime: Runtime,
+    live_tail: Option<LiveTail>,
+    status_message: Option<String>,
+    session_path: Option<PathBuf>,
 }
 
 impl GlowtailGpui {
-    fn new(snapshot: ViewportSnapshot) -> Self {
-        let row_count = snapshot.total_matching_rows;
+    fn new(
+        engine: Engine,
+        runtime: Runtime,
+        live_tail: Option<LiveTail>,
+        session_path: Option<PathBuf>,
+    ) -> Self {
+        let engine = Rc::new(RefCell::new(engine));
+        let (metadata, item_count) = {
+            let mut engine = engine.borrow_mut();
+            let metadata = engine.metadata_snapshot();
+            let count = engine.matching_rows_count();
+            (metadata, count)
+        };
+        let list_state = ListState::new(item_count, ListAlignment::Top, px(ROW_OVERDRAW));
         Self {
-            snapshot: Arc::new(snapshot),
-            list_state: ListState::new(row_count, ListAlignment::Top, px(ROW_OVERDRAW)),
+            engine,
+            metadata: Arc::new(metadata),
+            list_state,
+            runtime,
+            live_tail,
+            status_message: None,
+            session_path,
+        }
+    }
+
+    fn start_refresh_loop(&self, cx: &mut Context<Self>) {
+        if self.live_tail.is_none() {
+            return;
+        }
+
+        cx.spawn(
+            async move |view: gpui::WeakEntity<GlowtailGpui>, cx: &mut gpui::AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(LIVE_REFRESH_MS))
+                        .await;
+                    if view.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn drain_live_events(&mut self) -> bool {
+        let Some(live_tail) = self.live_tail.as_mut() else {
+            return false;
+        };
+
+        let mut changed = false;
+        loop {
+            match live_tail.receiver.try_recv() {
+                Ok(LogEvent::SourceAdded { source_id, path }) => {
+                    self.engine
+                        .borrow_mut()
+                        .add_source(source_id, path.display().to_string());
+                    changed = true;
+                }
+                Ok(LogEvent::RowAppended(row)) => {
+                    self.engine.borrow_mut().append_row(row);
+                    changed = true;
+                }
+                Ok(LogEvent::SourceRotated { source_id }) => {
+                    self.status_message = Some(format!("source {} rotated", source_id.0));
+                }
+                Ok(LogEvent::SourceError { source_id, message }) => {
+                    self.status_message = Some(format!("source {} error: {message}", source_id.0));
+                }
+                Ok(LogEvent::SourceRemoved { .. }) => {}
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.status_message = Some("live tail disconnected".into());
+                    break;
+                }
+            }
+        }
+
+        if changed {
+            self.refresh_metadata();
+            self.save_session();
+        }
+        changed
+    }
+
+    fn refresh_metadata(&mut self) {
+        let (metadata, new_count) = {
+            let mut engine = self.engine.borrow_mut();
+            (engine.metadata_snapshot(), engine.matching_rows_count())
+        };
+        self.metadata = Arc::new(metadata);
+        // Only rebuild the ListState if the row count actually changed —
+        // otherwise we'd snap the scroll position to the top on every frame.
+        if new_count != self.list_state.item_count() {
+            // Capture the current logical offset so we can restore it after
+            // the rebuild and avoid jumping to row 0 on every appended line.
+            let logical_offset = self.list_state.logical_scroll_top();
+            self.list_state = ListState::new(new_count, ListAlignment::Top, px(ROW_OVERDRAW));
+            self.list_state.scroll_to(logical_offset);
+        }
+    }
+
+    fn save_session(&self) {
+        let _ = save_session(self.session_path.as_ref(), self.engine.borrow().session());
+    }
+}
+
+impl Drop for GlowtailGpui {
+    fn drop(&mut self) {
+        self.save_session();
+        if let Some(mut live_tail) = self.live_tail.take() {
+            for tailer in live_tail.tailers.drain(..) {
+                self.runtime.block_on(tailer.stop());
+            }
         }
     }
 }
 
 impl Render for GlowtailGpui {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let snapshot = Arc::clone(&self.snapshot);
+        self.drain_live_events();
+        let metadata = Arc::clone(&self.metadata);
+        let engine = Rc::clone(&self.engine);
         div()
             .size_full()
             .bg(rgb(0x101418))
@@ -165,21 +371,36 @@ impl Render for GlowtailGpui {
             .font_family("monospace")
             .flex()
             .flex_col()
-            .child(top_bar(&snapshot))
+            .child(top_bar(
+                &metadata,
+                self.live_tail.is_some(),
+                self.status_message.as_deref(),
+            ))
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .overflow_hidden()
-                    .child(source_sidebar(&snapshot))
-                    .child(log_viewport(snapshot.clone(), self.list_state.clone()))
-                    .child(detail_panel(&snapshot)),
+                    .child(source_sidebar(&metadata))
+                    .child(log_viewport(engine.clone(), self.list_state.clone()))
+                    .child(detail_panel(engine)),
             )
-            .child(timeline_panel(&snapshot))
+            .child(timeline_panel(&metadata))
     }
 }
 
-fn top_bar(snapshot: &ViewportSnapshot) -> impl IntoElement {
+fn top_bar(
+    snapshot: &ViewportSnapshot,
+    live_tail_enabled: bool,
+    status_message: Option<&str>,
+) -> impl IntoElement {
+    let mode = if live_tail_enabled { "live" } else { "static" };
+    let status = status_message.unwrap_or(if live_tail_enabled {
+        "following appended lines"
+    } else {
+        "loaded once"
+    });
+
     div()
         .h(px(52.))
         .w_full()
@@ -203,12 +424,13 @@ fn top_bar(snapshot: &ViewportSnapshot) -> impl IntoElement {
             "error",
             snapshot.level_counts.error + snapshot.level_counts.fatal,
         ))
+        .child(metric_text("mode", mode))
         .child(
             div()
                 .ml_auto()
                 .text_sm()
                 .text_color(rgb(0x9aa7b2))
-                .child("GPUI components: sources · virtual list · timeline · JSON detail"),
+                .child(status.to_string()),
         )
 }
 
@@ -219,6 +441,15 @@ fn metric(label: &'static str, value: usize) -> impl IntoElement {
         .text_sm()
         .child(div().text_color(rgb(0x7f8b96)).child(label))
         .child(div().text_color(rgb(0xe6edf3)).child(value.to_string()))
+}
+
+fn metric_text(label: &'static str, value: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .gap_1()
+        .text_sm()
+        .child(div().text_color(rgb(0x7f8b96)).child(label))
+        .child(div().text_color(rgb(0xe6edf3)).child(value))
 }
 
 fn source_sidebar(snapshot: &ViewportSnapshot) -> impl IntoElement {
@@ -258,7 +489,7 @@ fn source_sidebar(snapshot: &ViewportSnapshot) -> impl IntoElement {
     panel
 }
 
-fn log_viewport(snapshot: Arc<ViewportSnapshot>, list_state: ListState) -> impl IntoElement {
+fn log_viewport(engine: Rc<RefCell<Engine>>, list_state: ListState) -> impl IntoElement {
     div()
         .flex_1()
         .h_full()
@@ -279,7 +510,7 @@ fn log_viewport(snapshot: Arc<ViewportSnapshot>, list_state: ListState) -> impl 
         )
         .child(
             list(list_state, move |index, _window, _cx| {
-                let row = snapshot.rows.get(index).cloned();
+                let row = engine.borrow_mut().present_row_at(index);
                 row_element(row, index)
             })
             .flex_1(),
@@ -309,7 +540,7 @@ fn row_element(row: Option<RowPresentation>, index: usize) -> gpui::AnyElement {
             div()
                 .w(px(4.))
                 .h_full()
-                .bg(severity_color(row.level))
+                .bg(severity_color(row.severity_role()))
                 .mr_2(),
         );
 
@@ -344,8 +575,11 @@ fn row_element(row: Option<RowPresentation>, index: usize) -> gpui::AnyElement {
     line.into_any()
 }
 
-fn detail_panel(snapshot: &ViewportSnapshot) -> impl IntoElement {
-    let selected = snapshot.rows.first();
+fn detail_panel(engine: Rc<RefCell<Engine>>) -> impl IntoElement {
+    // Show the first visible row's details. Without a click handler in
+    // gpui 0.2.2, the prototype settles for "first row" semantics that match
+    // the previous behaviour.
+    let selected = engine.borrow_mut().present_row_at(0);
     let mut panel = div()
         .w(px(320.))
         .h_full()
@@ -365,7 +599,7 @@ fn detail_panel(snapshot: &ViewportSnapshot) -> impl IntoElement {
         if let Some(level) = row.level {
             panel = panel.child(detail_line("level", format!("{level:?}")));
         }
-        let fields = json_field_pairs(row);
+        let fields = row.json_fields();
         if fields.is_empty() {
             panel = panel.child(
                 div()
@@ -381,7 +615,7 @@ fn detail_panel(snapshot: &ViewportSnapshot) -> impl IntoElement {
                     .child("JSON fields"),
             );
             for (key, value) in fields {
-                panel = panel.child(detail_line(key, value));
+                panel = panel.child(detail_line(key.to_string(), value.to_string()));
             }
         }
     } else {
@@ -466,30 +700,13 @@ fn timeline_panel(snapshot: &ViewportSnapshot) -> impl IntoElement {
     row.into_any()
 }
 
-fn json_field_pairs(row: &RowPresentation) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    let mut pending_key = None::<String>;
-    for span in &row.spans {
-        match span.kind {
-            SpanKind::JsonKey => pending_key = Some(span.text.to_string()),
-            SpanKind::JsonValue => {
-                if let Some(key) = pending_key.take() {
-                    fields.push((key, span.text.to_string()));
-                }
-            }
-            _ => {}
-        }
-    }
-    fields
-}
-
-fn severity_color(level: Option<LogLevel>) -> gpui::Rgba {
-    match level {
-        Some(LogLevel::Fatal | LogLevel::Error) => rgb(0xdc4f4f),
-        Some(LogLevel::Warn) => rgb(0xd6a33d),
-        Some(LogLevel::Info) => rgb(0x4f9ee3),
-        Some(LogLevel::Debug | LogLevel::Trace) => rgb(0x7c75d8),
-        None => rgb(0x4b5563),
+fn severity_color(role: SeverityRole) -> gpui::Rgba {
+    match role {
+        SeverityRole::Fatal | SeverityRole::Error => rgb(0xdc4f4f),
+        SeverityRole::Warn => rgb(0xd6a33d),
+        SeverityRole::Info => rgb(0x4f9ee3),
+        SeverityRole::Debug | SeverityRole::Trace => rgb(0x7c75d8),
+        SeverityRole::Unknown => rgb(0x4b5563),
     }
 }
 

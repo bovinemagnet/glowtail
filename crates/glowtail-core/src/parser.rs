@@ -27,6 +27,10 @@ impl PlainTextParser {
         .and_then(|token| LogLevel::parse(token))
     }
 
+    /// Attempts to parse the first whitespace-delimited token as an RFC3339
+    /// timestamp. Other common formats (Apache/syslog, ISO8601 without a UTC
+    /// offset, epoch seconds) silently leave `timestamp = None`; richer
+    /// detection will live in a per-format parser, not here.
     fn parse_timestamp(line: &str) -> Option<DateTime<Utc>> {
         line.split_whitespace()
             .next()
@@ -171,6 +175,11 @@ impl LogParser for JsonLineParser {
     }
 }
 
+/// Parser that first tries JSON-lines and falls back to plain text on any
+/// JSON parse error. The fallback is silent — a misconfigured JSON source
+/// looks like ordinary plain text, which is what you want when log files mix
+/// formats but means you won't be told about malformed JSON. UIs surface the
+/// result via per-source counters in [`SourceSummary`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CompositeParser {
     json: JsonLineParser,

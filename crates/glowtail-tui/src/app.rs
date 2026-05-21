@@ -1,5 +1,5 @@
 use crate::terminal::TerminalState;
-use crate::widgets::render;
+use crate::widgets::{CHROME_HEIGHT, render};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use glowtail_core::events::LogEvent;
@@ -17,29 +17,38 @@ pub fn run_tui_with_events(
     mut events: Option<mpsc::Receiver<LogEvent>>,
 ) -> Result<Engine> {
     let mut terminal_state = TerminalState::new()?;
-    let mut first_row = 0usize;
-    let mut follow = true;
-    let mut fold_stacks = false;
-    let mut input_mode = InputMode::Normal;
-    let mut input = String::new();
+    let mut state = TuiState::default();
 
     loop {
         drain_events(&mut engine, &mut events);
 
         let size = terminal_state.terminal.size()?;
-        let visible_rows = size.height.saturating_sub(2) as usize;
-        if follow {
-            let total = engine.matching_rows_count();
-            first_row = total.saturating_sub(visible_rows);
+        let visible_rows = (size.height as usize).saturating_sub(CHROME_HEIGHT);
+        let total = engine.matching_rows_count();
+        if state.follow {
+            state.first_row = total.saturating_sub(visible_rows);
+            state.selected_offset = visible_rows.saturating_sub(1);
         }
+        clamp_view(&mut state, visible_rows, total);
 
         let snapshot = engine.viewport(glowtail_core::model::ViewportRequest {
-            first_row,
+            first_row: state.first_row,
             row_count: visible_rows,
         });
 
         terminal_state.terminal.draw(|f| {
-            render(f, &snapshot, follow, fold_stacks, &input_mode, &input);
+            render(
+                f,
+                &snapshot,
+                state.follow,
+                state.fold_stacks,
+                &state.input_mode,
+                &state.input,
+                state
+                    .selected_offset
+                    .min(snapshot.rows.len().saturating_sub(1)),
+                state.status_message.as_deref(),
+            );
         })?;
 
         if event::poll(Duration::from_millis(50))?
@@ -48,89 +57,64 @@ pub fn run_tui_with_events(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match input_mode {
+            state.status_message = None;
+            match state.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('j') | KeyCode::Down => {
-                        follow = false;
-                        first_row = first_row.saturating_add(1)
+                        move_selection_down(&mut state, visible_rows, total)
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        follow = false;
-                        first_row = first_row.saturating_sub(1)
-                    }
+                    KeyCode::Char('k') | KeyCode::Up => move_selection_up(&mut state),
                     KeyCode::Char('g') => {
-                        follow = false;
-                        first_row = 0;
+                        state.follow = false;
+                        state.first_row = 0;
+                        state.selected_offset = 0;
                     }
                     KeyCode::Char('G') => {
-                        follow = false;
-                        first_row = engine.matching_rows_count().saturating_sub(visible_rows);
+                        state.follow = false;
+                        state.first_row = total.saturating_sub(visible_rows);
+                        state.selected_offset = visible_rows.saturating_sub(1);
                     }
-                    KeyCode::Char('f') => follow = !follow,
+                    KeyCode::Char('f') => state.follow = !state.follow,
                     KeyCode::Char('b') => {
-                        if let Some(row) = snapshot.rows.first() {
+                        if let Some(row) = snapshot.rows.get(
+                            state
+                                .selected_offset
+                                .min(snapshot.rows.len().saturating_sub(1)),
+                        ) {
                             engine.toggle_bookmark(row.row_id, None);
                         }
                     }
                     KeyCode::Char('z') => {
-                        fold_stacks = !fold_stacks;
-                        engine.set_stack_trace_folding(fold_stacks);
+                        state.fold_stacks = !state.fold_stacks;
+                        engine.set_stack_trace_folding(state.fold_stacks);
                     }
-                    KeyCode::Char('n') => {
-                        if let Some(row_id) = engine
-                            .next_search_result(snapshot.rows.first().map(|row| row.row_id), false)
-                            && let Some(position) = engine.filtered_position_for_row(row_id)
-                        {
-                            follow = false;
-                            first_row = position;
-                        }
-                    }
-                    KeyCode::Char('N') => {
-                        if let Some(row_id) = engine
-                            .next_search_result(snapshot.rows.first().map(|row| row.row_id), true)
-                            && let Some(position) = engine.filtered_position_for_row(row_id)
-                        {
-                            follow = false;
-                            first_row = position;
-                        }
-                    }
+                    KeyCode::Char('n') => jump_to_search(&mut engine, &snapshot, &mut state, false),
+                    KeyCode::Char('N') => jump_to_search(&mut engine, &snapshot, &mut state, true),
                     KeyCode::Char('/') => {
-                        input_mode = InputMode::Search;
-                        input.clear();
+                        state.input_mode = InputMode::Search;
+                        state.input.clear();
                     }
                     KeyCode::Char('F') => {
-                        input_mode = InputMode::Filter;
-                        input.clear();
+                        state.input_mode = InputMode::Filter;
+                        state.input.clear();
                     }
                     _ => {}
                 },
                 InputMode::Search | InputMode::Filter => match key.code {
                     KeyCode::Esc => {
-                        input_mode = InputMode::Normal;
-                        input.clear();
+                        state.input_mode = InputMode::Normal;
+                        state.input.clear();
                     }
                     KeyCode::Enter => {
-                        match input_mode {
-                            InputMode::Search => engine.set_search_text(Some(input.clone())),
-                            InputMode::Filter => {
-                                if input.trim().is_empty() {
-                                    engine.clear_filter();
-                                } else {
-                                    let _ = engine.set_filter(
-                                        glowtail_core::filter::FilterExpr::Contains(input.clone()),
-                                    );
-                                }
-                            }
-                            InputMode::Normal => {}
-                        }
-                        input_mode = InputMode::Normal;
-                        input.clear();
+                        apply_input(&mut engine, &mut state);
+                        state.input_mode = InputMode::Normal;
+                        state.input.clear();
                     }
                     KeyCode::Backspace => {
-                        input.pop();
+                        state.input.pop();
                     }
-                    KeyCode::Char(c) => input.push(c),
+                    KeyCode::Char(c) => state.input.push(c),
                     _ => {}
                 },
             }
@@ -138,6 +122,74 @@ pub fn run_tui_with_events(
     }
 
     Ok(engine)
+}
+
+fn apply_input(engine: &mut Engine, state: &mut TuiState) {
+    match state.input_mode {
+        InputMode::Search => engine.set_search_text(Some(state.input.clone())),
+        InputMode::Filter => {
+            if state.input.trim().is_empty() {
+                engine.clear_filter();
+            } else if let Err(err) = engine.set_filter(glowtail_core::filter::FilterExpr::Contains(
+                state.input.clone(),
+            )) {
+                state.status_message = Some(format!("filter error: {err}"));
+            }
+        }
+        InputMode::Normal => {}
+    }
+}
+
+fn jump_to_search(
+    engine: &mut Engine,
+    snapshot: &glowtail_core::model::ViewportSnapshot,
+    state: &mut TuiState,
+    reverse: bool,
+) {
+    let current = snapshot
+        .rows
+        .get(state.selected_offset)
+        .map(|row| row.row_id);
+    let Some(row_id) = engine.next_search_result(current, reverse) else {
+        state.status_message = Some("no search results".into());
+        return;
+    };
+    let Some(position) = engine.filtered_position_for_row(row_id) else {
+        return;
+    };
+    state.follow = false;
+    state.first_row = position.saturating_sub(state.selected_offset);
+}
+
+fn move_selection_down(state: &mut TuiState, visible_rows: usize, total: usize) {
+    state.follow = false;
+    if state.selected_offset + 1 < visible_rows {
+        state.selected_offset += 1;
+    } else if state.first_row + visible_rows < total {
+        state.first_row += 1;
+    }
+}
+
+fn move_selection_up(state: &mut TuiState) {
+    state.follow = false;
+    if state.selected_offset > 0 {
+        state.selected_offset -= 1;
+    } else if state.first_row > 0 {
+        state.first_row -= 1;
+    }
+}
+
+fn clamp_view(state: &mut TuiState, visible_rows: usize, total: usize) {
+    let max_first_row = total.saturating_sub(visible_rows);
+    if state.first_row > max_first_row {
+        state.first_row = max_first_row;
+    }
+    let visible_in_window = total.saturating_sub(state.first_row).min(visible_rows);
+    if visible_in_window == 0 {
+        state.selected_offset = 0;
+    } else if state.selected_offset >= visible_in_window {
+        state.selected_offset = visible_in_window - 1;
+    }
 }
 
 fn drain_events(engine: &mut Engine, events: &mut Option<mpsc::Receiver<LogEvent>>) {
@@ -166,8 +218,32 @@ fn drain_events(engine: &mut Engine, events: &mut Option<mpsc::Receiver<LogEvent
     }
 }
 
+struct TuiState {
+    first_row: usize,
+    selected_offset: usize,
+    follow: bool,
+    fold_stacks: bool,
+    input_mode: InputMode,
+    input: String,
+    status_message: Option<String>,
+}
+
+impl Default for TuiState {
+    fn default() -> Self {
+        Self {
+            first_row: 0,
+            selected_offset: 0,
+            follow: true,
+            fold_stacks: false,
+            input_mode: InputMode::Normal,
+            input: String::new(),
+            status_message: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-enum InputMode {
+pub enum InputMode {
     Normal,
     Search,
     Filter,

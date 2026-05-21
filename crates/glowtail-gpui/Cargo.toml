@@ -9,3 +9,4 @@ anyhow.workspace = true
 clap.workspace = true
 glowtail-core = { path = "../glowtail-core" }
 gpui.workspace = true
+tokio.workspace = true

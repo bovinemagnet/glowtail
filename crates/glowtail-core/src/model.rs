@@ -17,6 +17,7 @@ pub struct ByteRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -41,6 +42,7 @@ impl LogLevel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogSourceKind {
     File,
     Stdin,
@@ -121,7 +123,11 @@ pub struct LogRow {
     pub fields: ParsedFields,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Semantic role of a span inside a [`RowPresentation`]. UI front-ends translate
+/// these into their own styling at the seam (e.g. `SpanKind::Error` →
+/// `ratatui::style::Color::Red`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SpanKind {
     Timestamp,
     Level,
@@ -133,6 +139,36 @@ pub enum SpanKind {
     Error,
     Warning,
     StackTrace,
+}
+
+/// Semantic colour role for a log row's severity band. UIs map this onto their
+/// native colour type at the seam; the core never names colours directly.
+/// Mirrors [`LogLevel`] plus an `Unknown` variant for unparseable severities;
+/// not marked `#[non_exhaustive]` because any new variant here will land in
+/// lockstep with one on `LogLevel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeverityRole {
+    Fatal,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+    Unknown,
+}
+
+impl SeverityRole {
+    pub fn from_level(level: Option<LogLevel>) -> Self {
+        match level {
+            Some(LogLevel::Fatal) => Self::Fatal,
+            Some(LogLevel::Error) => Self::Error,
+            Some(LogLevel::Warn) => Self::Warn,
+            Some(LogLevel::Info) => Self::Info,
+            Some(LogLevel::Debug) => Self::Debug,
+            Some(LogLevel::Trace) => Self::Trace,
+            None => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +190,34 @@ pub struct RowPresentation {
     pub is_bookmarked: bool,
     pub is_stack_continuation: bool,
     pub folded_stack_rows: usize,
+}
+
+impl RowPresentation {
+    /// Iterate semantic JSON key/value pairs present on this row. Both UIs use
+    /// the same logic to build a structured-field detail panel; the core owns
+    /// it so they don't drift.
+    pub fn json_fields(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        let mut fields = Vec::new();
+        let mut pending_key: Option<Arc<str>> = None;
+        for span in &self.spans {
+            match span.kind {
+                SpanKind::JsonKey => pending_key = Some(span.text.clone()),
+                SpanKind::JsonValue => {
+                    if let Some(key) = pending_key.take() {
+                        fields.push((key, span.text.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        fields
+    }
+
+    /// Convenience accessor for the row's severity role. UIs use this to map
+    /// onto their native colour for the severity gutter.
+    pub fn severity_role(&self) -> SeverityRole {
+        SeverityRole::from_level(self.level)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

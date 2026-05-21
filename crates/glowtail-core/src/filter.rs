@@ -3,6 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FilterExpr {
     #[default]
     All,
@@ -45,7 +46,36 @@ impl FilterExpr {
     }
 }
 
+/// Composition of the three CLI/UI filter inputs:
+///   - `saved_filter`: name of a session-stored filter to start from
+///   - `level`: minimum severity (kept if at or above this level)
+///   - `contains`: case-insensitive substring filter
+///
+/// Returns `Ok(filter)` even when all three are `None` (the result is then
+/// [`FilterExpr::All`]). Returns `Err(saved_filter)` when a saved-filter name
+/// is given but not present in the session, so callers can render an error.
+pub fn compose_filter(
+    saved_filter: Option<&crate::filter::FilterExpr>,
+    level: Option<LogLevel>,
+    contains: Option<&str>,
+) -> FilterExpr {
+    let mut parts = Vec::new();
+    if let Some(filter) = saved_filter {
+        parts.push(filter.clone());
+    }
+    if let Some(level) = level {
+        parts.push(FilterExpr::LevelAtLeast(level));
+    }
+    if let Some(text) = contains
+        && !text.is_empty()
+    {
+        parts.push(FilterExpr::Contains(text.to_owned()));
+    }
+    FilterExpr::and_all(parts)
+}
+
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FilterError {
     #[error("invalid regex '{pattern}': {source}")]
     InvalidRegex {

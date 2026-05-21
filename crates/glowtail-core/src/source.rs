@@ -61,6 +61,13 @@ impl FileTailer {
                             }
                         };
 
+                        // When the file shrinks we assume rotation: reset the
+                        // read cursor to 0 and notify consumers. `next_row`
+                        // intentionally keeps advancing so `RowId`s remain
+                        // unique within a session, but the `ByteRange` on rows
+                        // appended before the rotation now points into the
+                        // rotated-away file generation — treat those byte
+                        // ranges as opaque history once `SourceRotated` fires.
                         if file_len < offset {
                             offset = 0;
                             let _ = sender.send(LogEvent::SourceRotated { source_id }).await;
