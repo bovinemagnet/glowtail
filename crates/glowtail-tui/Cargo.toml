@@ -1,0 +1,11 @@
+[package]
+name = "glowtail-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+glowtail-core = { path = "../glowtail-core" }
+ratatui.workspace = true
