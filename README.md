@@ -70,7 +70,22 @@ cargo run -p glowtail-gpui -- samples/mixed.log --session .glowtail-gpui-session
 
 By default the GPUI app follows appended lines through the shared `glowtail-core` tailer. Use `--no-follow` for a static preload, or `--from-start` to have the live tailer replay existing file contents before following new lines. `--session`, `--use-filter`, and `--save-filter` work as they do in the terminal commands and the GUI.
 
-The GPUI prototype currently has no in-app filter, search, command palette, or row-selection controls — drive it via CLI flags and the session file. The GUI (`glowtail-gui`) is the front-end with full interactive controls.
+The GPUI prototype has no in-app search, command palette, or row-selection controls — for those, use the GUI (`glowtail-gui`). It does have keyboard-driven filtering:
+
+| Key | Action |
+|-----|--------|
+| `1` / `2` / `3` / `4` / `5` / `6` | Set `--level` filter to trace / debug / info / warn / error / fatal |
+| `0` | Clear the level filter |
+| `s` | Cycle through saved filters loaded from `--session` (none → first → … → last → none) |
+| `/` | Focus the filter text input |
+| `enter` | Apply the typed filter text (composes with the active level and saved filter) |
+| `escape` | Cancel filter input editing and restore the previously applied text |
+| `backspace` | Delete the trailing character while editing |
+| `↑` / `↓` / `PgUp` / `PgDn` / `Home` / `End` | Scroll vertically; `End` re-engages follow mode |
+| `←` / `→` / `Cmd+←` | Scroll horizontally / reset to the line start |
+| `f` | Toggle follow mode (auto-scroll to the bottom on appended rows) |
+
+The text input is intentionally minimal: append-only, no cursor positioning, no IME composition. Use `escape` to discard a partial edit.
 
 ### Tailing a log file with glowtail-gpui
 

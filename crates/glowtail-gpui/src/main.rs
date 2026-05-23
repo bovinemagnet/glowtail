@@ -45,9 +45,75 @@ actions!(
         FilterError,
         FilterFatal,
         FilterClear,
-        CycleSavedFilter
+        CycleSavedFilter,
+        FocusFilterInput,
+        BlurFilterInput,
+        SubmitFilterInput,
+        FilterInputBackspace
     ]
 );
+
+/// Append-only single-line text buffer for the filter input. No cursor
+/// positioning, no selection — pressing a key appends, backspace removes
+/// the trailing character. Kept as a plain struct (no GPUI dependency) so
+/// the mutation rules can be unit-tested in isolation.
+#[derive(Debug, Default, Clone)]
+struct TextInputState {
+    value: String,
+}
+
+impl TextInputState {
+    fn new(initial: Option<String>) -> Self {
+        Self {
+            value: initial.unwrap_or_default(),
+        }
+    }
+
+    fn append_char(&mut self, c: char) {
+        self.value.push(c);
+    }
+
+    /// Pop the trailing character — UTF-8 safe because `String::pop` operates
+    /// on `Option<char>`, not bytes.
+    fn backspace(&mut self) {
+        self.value.pop();
+    }
+
+    fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Decide whether a [`gpui::Keystroke`] should be appended to a focused
+/// text input. Accepts single-char `key_char`s when no non-shift modifier
+/// is held — so plain letters, digits, punctuation and shifted variants
+/// (capitals, `!`, `@`, etc.) flow through, while `cmd-a`, `ctrl-c`, and
+/// special keys like `tab`/`enter`/`backspace` (whose `key_char` is
+/// `None` on every platform we target) are rejected. Pulled out as a
+/// pure fn so the filter logic can be unit-tested.
+fn keystroke_to_input_char(
+    key_char: Option<&str>,
+    has_command: bool,
+    has_control: bool,
+    has_alt: bool,
+    has_function: bool,
+) -> Option<char> {
+    if has_command || has_control || has_alt || has_function {
+        return None;
+    }
+    let s = key_char?;
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    // Reject multi-grapheme inputs (composed emoji, IME output) for the
+    // MVP; this matches the "ASCII-and-shifted-ASCII only" scope.
+    if chars.next().is_some() {
+        return None;
+    }
+    if first.is_control() {
+        return None;
+    }
+    Some(first)
+}
 
 /// Compute the next index into the saved-filter cycle. `None` means "no
 /// saved filter applied"; pressing past the last filter wraps back to
@@ -173,6 +239,10 @@ fn main() -> Result<()> {
             KeyBinding::new("6", FilterFatal, None),
             KeyBinding::new("0", FilterClear, None),
             KeyBinding::new("s", CycleSavedFilter, None),
+            KeyBinding::new("/", FocusFilterInput, None),
+            KeyBinding::new("escape", BlurFilterInput, None),
+            KeyBinding::new("enter", SubmitFilterInput, None),
+            KeyBinding::new("backspace", FilterInputBackspace, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         let result = cx.open_window(
@@ -249,6 +319,15 @@ struct GlowtailGpui {
     /// Cycle cursor for `CycleSavedFilter` (`s`). `None` = no saved filter
     /// applied; otherwise the 0-based index into `session.saved_filters`.
     saved_filter_cycle_idx: Option<usize>,
+    /// Buffered text the user is currently typing into the filter input.
+    /// Becomes `current_text` only on `Enter`; until then the engine sees
+    /// the previously-submitted value.
+    filter_input: TextInputState,
+    /// True while the filter input is accepting keystrokes — suppresses
+    /// the navigation keybindings (digits, `f`, `s`, arrow keys, etc.) so
+    /// pressing those keys types into the input instead of triggering an
+    /// action.
+    filter_focused: bool,
 }
 
 impl GlowtailGpui {
@@ -286,8 +365,10 @@ impl GlowtailGpui {
             follow,
             current_level: initial_level,
             current_use_filter: initial_use_filter,
-            current_text: initial_text,
+            current_text: initial_text.clone(),
             saved_filter_cycle_idx: None,
+            filter_input: TextInputState::new(initial_text),
+            filter_focused: false,
         }
     }
 
@@ -398,24 +479,39 @@ impl GlowtailGpui {
     }
 
     fn on_scroll_up(&mut self, _: &ScrollUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.follow = false;
         self.scroll_by_items(-1);
         cx.notify();
     }
     fn on_scroll_down(&mut self, _: &ScrollDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.scroll_by_items(1);
         cx.notify();
     }
     fn on_page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.follow = false;
         self.scroll_by_items(-(PAGE_SIZE_HINT as isize));
         cx.notify();
     }
     fn on_page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.scroll_by_items(PAGE_SIZE_HINT as isize);
         cx.notify();
     }
     fn on_scroll_home(&mut self, _: &ScrollHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.follow = false;
         self.list_state.scroll_to(ListOffset {
             item_ix: 0,
@@ -424,11 +520,17 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_scroll_end(&mut self, _: &ScrollEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.follow = true;
         self.scroll_to_bottom();
         cx.notify();
     }
     fn on_toggle_follow(&mut self, _: &ToggleFollow, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.follow = !self.follow;
         if self.follow {
             self.scroll_to_bottom();
@@ -436,10 +538,16 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_scroll_left(&mut self, _: &ScrollLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.horizontal_offset_px = (self.horizontal_offset_px - HORIZONTAL_STEP_PX).max(0.0);
         cx.notify();
     }
     fn on_scroll_right(&mut self, _: &ScrollRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.horizontal_offset_px += HORIZONTAL_STEP_PX;
         cx.notify();
     }
@@ -449,6 +557,9 @@ impl GlowtailGpui {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.filter_focused {
+            return;
+        }
         self.horizontal_offset_px = 0.0;
         cx.notify();
     }
@@ -477,6 +588,9 @@ impl GlowtailGpui {
     }
 
     fn set_level_filter(&mut self, level: Option<LevelArg>, cx: &mut Context<Self>) {
+        if self.filter_focused {
+            return;
+        }
         self.current_level = level;
         self.status_message = Some(match level {
             None => "level filter cleared".into(),
@@ -514,6 +628,9 @@ impl GlowtailGpui {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.filter_focused {
+            return;
+        }
         let names: Vec<String> = self
             .engine
             .borrow()
@@ -536,6 +653,101 @@ impl GlowtailGpui {
         });
         self.recompute_filter();
         cx.notify();
+    }
+
+    fn on_focus_filter_input(
+        &mut self,
+        _: &FocusFilterInput,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter_focused {
+            self.filter_focused = true;
+            self.status_message = Some("filter: typing... (enter to apply, esc to cancel)".into());
+            cx.notify();
+        }
+    }
+
+    fn on_blur_filter_input(
+        &mut self,
+        _: &BlurFilterInput,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter_focused {
+            return;
+        }
+        self.filter_focused = false;
+        // Restore the input buffer to whatever was last submitted so a future
+        // refocus doesn't show abandoned keystrokes.
+        self.filter_input = TextInputState::new(self.current_text.clone());
+        self.status_message = Some("filter input cancelled".into());
+        cx.notify();
+    }
+
+    fn on_submit_filter_input(
+        &mut self,
+        _: &SubmitFilterInput,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter_focused {
+            return;
+        }
+        let trimmed = self.filter_input.value().trim();
+        self.current_text = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        self.filter_focused = false;
+        self.status_message = Some(match &self.current_text {
+            None => "text filter cleared".into(),
+            Some(text) => format!("text filter: {text}"),
+        });
+        self.recompute_filter();
+        cx.notify();
+    }
+
+    fn on_filter_input_backspace(
+        &mut self,
+        _: &FilterInputBackspace,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter_focused {
+            return;
+        }
+        self.filter_input.backspace();
+        cx.notify();
+    }
+
+    /// Bubble-phase key handler that captures printable input into the filter
+    /// buffer when [`Self::filter_focused`] is true. Action bindings still
+    /// fire alongside this (GPUI dispatches both), but the navigation
+    /// handlers each guard on `filter_focused` so the net effect is "keys
+    /// type into the input, nothing else moves".
+    fn on_key_down_capture(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.filter_focused {
+            return;
+        }
+        let ks = &event.keystroke;
+        let m = &ks.modifiers;
+        if let Some(c) = keystroke_to_input_char(
+            ks.key_char.as_deref(),
+            m.platform,
+            m.control,
+            m.alt,
+            m.function,
+        ) {
+            self.filter_input.append_char(c);
+            cx.notify();
+        }
     }
 }
 
@@ -595,6 +807,11 @@ impl Render for GlowtailGpui {
             .on_action(cx.listener(Self::on_filter_fatal))
             .on_action(cx.listener(Self::on_filter_clear))
             .on_action(cx.listener(Self::on_cycle_saved_filter))
+            .on_action(cx.listener(Self::on_focus_filter_input))
+            .on_action(cx.listener(Self::on_blur_filter_input))
+            .on_action(cx.listener(Self::on_submit_filter_input))
+            .on_action(cx.listener(Self::on_filter_input_backspace))
+            .on_key_down(cx.listener(Self::on_key_down_capture))
             .bg(rgb(0x101418))
             .text_color(rgb(0xd8dee9))
             .font_family("monospace")
@@ -608,6 +825,8 @@ impl Render for GlowtailGpui {
                 self.engine.borrow().evicted_row_count(),
                 self.current_level,
                 self.current_use_filter.as_deref(),
+                self.filter_input.value(),
+                self.filter_focused,
             ))
             .child(
                 div()
@@ -626,6 +845,7 @@ impl Render for GlowtailGpui {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn top_bar(
     snapshot: &ViewportSnapshot,
     live_tail_enabled: bool,
@@ -634,6 +854,8 @@ fn top_bar(
     evicted_count: u64,
     current_level: Option<LevelArg>,
     current_use_filter: Option<&str>,
+    filter_input: &str,
+    filter_focused: bool,
 ) -> impl IntoElement {
     let mode = if live_tail_enabled { "live" } else { "static" };
     let follow_label = if !live_tail_enabled {
@@ -684,7 +906,8 @@ fn top_bar(
         .child(metric_text("mode", mode))
         .child(metric_text("follow", follow_label))
         .child(metric_string("level", level_label))
-        .child(metric_string("saved", saved_label));
+        .child(metric_string("saved", saved_label))
+        .child(filter_input_cell(filter_input, filter_focused));
 
     if evicted_count > 0 {
         bar = bar.child(
@@ -729,6 +952,36 @@ fn metric_string(label: &'static str, value: String) -> impl IntoElement {
         .text_sm()
         .child(div().text_color(rgb(0x7f8b96)).child(label))
         .child(div().text_color(rgb(0xe6edf3)).child(value))
+}
+
+/// Top-bar cell that doubles as the filter text input. When unfocused it
+/// shows the active text filter as plain text (or an em-dash placeholder).
+/// When focused it gains a coloured border and a trailing caret glyph so
+/// the user can see they're typing into something live.
+fn filter_input_cell(value: &str, focused: bool) -> impl IntoElement {
+    let display = if value.is_empty() && !focused {
+        "—".to_string()
+    } else if focused {
+        // Visual caret. No real cursor positioning yet (MVP appends only),
+        // so a trailing block is honest about where the next char will land.
+        format!("{value}▌")
+    } else {
+        value.to_string()
+    };
+    let border_color = if focused {
+        rgb(0x4f9ee3)
+    } else {
+        rgb(0x26313b)
+    };
+    div()
+        .flex()
+        .gap_1()
+        .text_sm()
+        .px_2()
+        .border_1()
+        .border_color(border_color)
+        .child(div().text_color(rgb(0x7f8b96)).child("filter"))
+        .child(div().text_color(rgb(0xe6edf3)).child(display))
 }
 
 fn source_sidebar(snapshot: &ViewportSnapshot) -> impl IntoElement {
@@ -1017,7 +1270,7 @@ fn span_color(kind: SpanKind) -> gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::next_saved_filter_cycle;
+    use super::{TextInputState, keystroke_to_input_char, next_saved_filter_cycle};
 
     #[test]
     fn cycle_with_no_saved_filters_returns_none() {
@@ -1045,5 +1298,87 @@ mod tests {
     fn cycle_with_single_saved_filter_toggles_none_and_zero() {
         assert_eq!(next_saved_filter_cycle(None, 1), Some(0));
         assert_eq!(next_saved_filter_cycle(Some(0), 1), None);
+    }
+
+    #[test]
+    fn text_input_appends_and_backspaces() {
+        let mut input = TextInputState::new(None);
+        assert_eq!(input.value(), "");
+        input.append_char('a');
+        input.append_char('b');
+        input.append_char('c');
+        assert_eq!(input.value(), "abc");
+        input.backspace();
+        assert_eq!(input.value(), "ab");
+    }
+
+    #[test]
+    fn text_input_backspace_on_empty_is_noop() {
+        let mut input = TextInputState::new(None);
+        input.backspace();
+        input.backspace();
+        assert_eq!(input.value(), "");
+    }
+
+    #[test]
+    fn text_input_backspace_pops_whole_utf8_char() {
+        // "é" is two bytes in UTF-8; backspace must not split it.
+        let mut input = TextInputState::new(Some("café".into()));
+        input.backspace();
+        assert_eq!(input.value(), "caf");
+    }
+
+    #[test]
+    fn keystroke_to_input_char_accepts_plain_chars() {
+        assert_eq!(
+            keystroke_to_input_char(Some("a"), false, false, false, false),
+            Some('a')
+        );
+        assert_eq!(
+            keystroke_to_input_char(Some("A"), false, false, false, false),
+            Some('A')
+        );
+        assert_eq!(
+            keystroke_to_input_char(Some("!"), false, false, false, false),
+            Some('!')
+        );
+    }
+
+    #[test]
+    fn keystroke_to_input_char_rejects_modifier_combos() {
+        // cmd-a / ctrl-c / alt-f4 should never reach the text buffer.
+        assert_eq!(
+            keystroke_to_input_char(Some("a"), true, false, false, false),
+            None
+        );
+        assert_eq!(
+            keystroke_to_input_char(Some("c"), false, true, false, false),
+            None
+        );
+        assert_eq!(
+            keystroke_to_input_char(Some("f"), false, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn keystroke_to_input_char_rejects_special_and_multi_char_input() {
+        // Special keys (backspace, enter, escape) have no key_char on every
+        // platform we target — the platform layer surfaces them through
+        // `key` instead.
+        assert_eq!(
+            keystroke_to_input_char(None, false, false, false, false),
+            None
+        );
+        // Composed/IME multi-grapheme: MVP doesn't accept these.
+        assert_eq!(
+            keystroke_to_input_char(Some("ab"), false, false, false, false),
+            None
+        );
+        // Control characters (e.g. \r, \t) should not be appended.
+        assert_eq!(
+            keystroke_to_input_char(Some("\r"), false, false, false, false),
+            None
+        );
     }
 }
