@@ -9,6 +9,16 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 const ROW_HEIGHT: f32 = 22.0;
+const HORIZONTAL_STEP_PX: f32 = 8.0;
+
+/// Clamp `current + delta` to `[0, total - 1]`. Returns `0` when `total == 0`.
+fn scroll_target(current: usize, delta: isize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let max = (total - 1) as isize;
+    (current as isize + delta).clamp(0, max) as usize
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "glowtail-gui")]
@@ -259,6 +269,9 @@ struct GlowtailGui {
     status_message: Option<String>,
     saved_filter_name: String,
     scroll_to_row: Option<usize>,
+    horizontal_offset_px: f32,
+    current_first_row: usize,
+    current_page_size: usize,
 }
 
 impl GlowtailGui {
@@ -285,6 +298,9 @@ impl GlowtailGui {
             status_message,
             saved_filter_name: String::new(),
             scroll_to_row: None,
+            horizontal_offset_px: 0.0,
+            current_first_row: 0,
+            current_page_size: 1,
         }
     }
 
@@ -540,6 +556,8 @@ impl GlowtailGui {
                 scroll = scroll.vertical_scroll_offset(row as f32 * ROW_HEIGHT);
             }
             scroll.show_rows(ui, ROW_HEIGHT, total_matching_rows, |ui, range| {
+                self.current_first_row = range.start;
+                self.current_page_size = range.end.saturating_sub(range.start).max(1);
                 let page = self.engine.viewport(ViewportRequest {
                     first_row: range.start,
                     row_count: range.end.saturating_sub(range.start),
@@ -577,7 +595,7 @@ impl GlowtailGui {
             color,
         );
 
-        let mut x = rect.left() + 10.0;
+        let mut x = rect.left() + 10.0 - self.horizontal_offset_px;
         if row.is_bookmarked {
             x = paint_text(
                 ui,
@@ -730,6 +748,45 @@ impl GlowtailGui {
             input.key_pressed(egui::Key::N) && input.modifiers.command && input.modifiers.shift
         }) {
             self.select_search_result(true);
+        }
+
+        // Scroll navigation. `consume_key` prevents egui's ScrollArea from
+        // double-handling arrow/page keys.
+        let total = self.engine.matching_rows_count();
+        let first = self.current_first_row;
+        let page = self.current_page_size.max(1) as isize;
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            self.scroll_to_row = Some(scroll_target(first, -1, total));
+            self.follow = false;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            self.scroll_to_row = Some(scroll_target(first, 1, total));
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)) {
+            self.scroll_to_row = Some(scroll_target(first, -page, total));
+            self.follow = false;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)) {
+            self.scroll_to_row = Some(scroll_target(first, page, total));
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home)) {
+            self.scroll_to_row = Some(0);
+            self.follow = false;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End)) {
+            self.follow = true;
+        }
+
+        // Horizontal scroll.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
+            self.horizontal_offset_px = (self.horizontal_offset_px - HORIZONTAL_STEP_PX).max(0.0);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
+            self.horizontal_offset_px += HORIZONTAL_STEP_PX;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowLeft)) {
+            self.horizontal_offset_px = 0.0;
         }
     }
 
@@ -950,5 +1007,33 @@ fn severity_color(role: SeverityRole) -> egui::Color32 {
         SeverityRole::Info => egui::Color32::from_rgb(80, 150, 220),
         SeverityRole::Debug | SeverityRole::Trace => egui::Color32::from_rgb(120, 120, 160),
         SeverityRole::Unknown => egui::Color32::from_gray(70),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scroll_target;
+
+    #[test]
+    fn scroll_target_clamps_below_zero() {
+        assert_eq!(scroll_target(0, -1, 100), 0);
+        assert_eq!(scroll_target(5, -10, 100), 0);
+    }
+
+    #[test]
+    fn scroll_target_advances_in_range() {
+        assert_eq!(scroll_target(50, 10, 100), 60);
+    }
+
+    #[test]
+    fn scroll_target_clamps_above_last() {
+        assert_eq!(scroll_target(99, 10, 100), 99);
+        assert_eq!(scroll_target(0, 1_000, 100), 99);
+    }
+
+    #[test]
+    fn scroll_target_with_empty_list_returns_zero() {
+        assert_eq!(scroll_target(0, 0, 0), 0);
+        assert_eq!(scroll_target(10, 5, 0), 0);
     }
 }

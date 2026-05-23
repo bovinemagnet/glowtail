@@ -3,9 +3,9 @@ use clap::{Parser, ValueEnum};
 use glowtail_core::filter::compose_query_filter;
 use glowtail_core::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, IntoElement, ListAlignment, ListState, ParentElement,
-    Render, SharedString, Styled, Window, WindowBounds, WindowOptions, div, list, prelude::*, px,
-    rgb, size,
+    App, Application, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
+    ListAlignment, ListOffset, ListState, ParentElement, Pixels, Render, SharedString, Styled,
+    Window, WindowBounds, WindowOptions, actions, div, list, prelude::*, px, rgb, size,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -17,6 +17,27 @@ use tokio::sync::mpsc;
 
 const ROW_OVERDRAW: f32 = 640.0;
 const LIVE_REFRESH_MS: u64 = 100;
+const HORIZONTAL_STEP_PX: f32 = 8.0;
+/// Approximate visible row count used for Page Up/Down. The window default is
+/// 900 px tall with ~24 px rows minus chrome — 25 leaves headroom on small
+/// windows without overshooting on the default.
+const PAGE_SIZE_HINT: usize = 25;
+
+actions!(
+    glowtail_gpui,
+    [
+        ScrollUp,
+        ScrollDown,
+        PageUp,
+        PageDown,
+        ScrollHome,
+        ScrollEnd,
+        ScrollLeft,
+        ScrollRight,
+        ScrollLineStart,
+        ToggleFollow
+    ]
+);
 
 #[derive(Debug, Parser)]
 #[command(name = "glowtail-gpui")]
@@ -108,6 +129,18 @@ fn main() -> Result<()> {
         Arc::new(std::sync::Mutex::new(None));
     let launch_error_clone = Arc::clone(&launch_error);
     Application::new().run(move |cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("up", ScrollUp, None),
+            KeyBinding::new("down", ScrollDown, None),
+            KeyBinding::new("pageup", PageUp, None),
+            KeyBinding::new("pagedown", PageDown, None),
+            KeyBinding::new("home", ScrollHome, None),
+            KeyBinding::new("end", ScrollEnd, None),
+            KeyBinding::new("left", ScrollLeft, None),
+            KeyBinding::new("right", ScrollRight, None),
+            KeyBinding::new("cmd-left", ScrollLineStart, None),
+            KeyBinding::new("f", ToggleFollow, None),
+        ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         let result = cx.open_window(
             WindowOptions {
@@ -117,6 +150,8 @@ fn main() -> Result<()> {
             },
             move |_, cx| {
                 cx.new(move |cx| {
+                    let mut app = app;
+                    app.focus_handle = Some(cx.focus_handle());
                     app.start_refresh_loop(cx);
                     app
                 })
@@ -264,6 +299,15 @@ struct GlowtailGpui {
     live_tail: Option<LiveTail>,
     status_message: Option<String>,
     session_path: Option<PathBuf>,
+    horizontal_offset_px: f32,
+    /// When true, every newly appended row scrolls the viewport to the bottom.
+    /// Disabled by any upward navigation; re-enabled by `End` or the `f` toggle.
+    follow: bool,
+    /// Populated in the `cx.new(...)` constructor closure once a `Context` is
+    /// available. Used by `track_focus` on the root div so keyboard actions
+    /// have somewhere to dispatch.
+    focus_handle: Option<FocusHandle>,
+    focused_once: bool,
 }
 
 impl GlowtailGpui {
@@ -282,6 +326,7 @@ impl GlowtailGpui {
             (metadata, count)
         };
         let list_state = ListState::new(item_count, ListAlignment::Top, px(ROW_OVERDRAW));
+        let follow = live_tail.is_some();
         Self {
             engine,
             metadata: Arc::new(metadata),
@@ -290,6 +335,10 @@ impl GlowtailGpui {
             live_tail,
             status_message,
             session_path,
+            horizontal_offset_px: 0.0,
+            focus_handle: None,
+            focused_once: false,
+            follow,
         }
     }
 
@@ -369,10 +418,90 @@ impl GlowtailGpui {
             self.list_state = ListState::new(new_count, ListAlignment::Top, px(ROW_OVERDRAW));
             self.list_state.scroll_to(logical_offset);
         }
+        if self.follow {
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        let total = self.list_state.item_count();
+        if total > 0 {
+            self.list_state.scroll_to_reveal_item(total - 1);
+        }
     }
 
     fn save_session(&self) {
         let _ = save_session(self.session_path.as_ref(), self.engine.borrow().session());
+    }
+
+    fn scroll_by_items(&mut self, delta: isize) {
+        let total = self.list_state.item_count();
+        if total == 0 {
+            return;
+        }
+        let top = self.list_state.logical_scroll_top();
+        let max = total as isize - 1;
+        let new_ix = (top.item_ix as isize + delta).clamp(0, max) as usize;
+        self.list_state.scroll_to(ListOffset {
+            item_ix: new_ix,
+            offset_in_item: Pixels::ZERO,
+        });
+    }
+
+    fn on_scroll_up(&mut self, _: &ScrollUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow = false;
+        self.scroll_by_items(-1);
+        cx.notify();
+    }
+    fn on_scroll_down(&mut self, _: &ScrollDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by_items(1);
+        cx.notify();
+    }
+    fn on_page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow = false;
+        self.scroll_by_items(-(PAGE_SIZE_HINT as isize));
+        cx.notify();
+    }
+    fn on_page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by_items(PAGE_SIZE_HINT as isize);
+        cx.notify();
+    }
+    fn on_scroll_home(&mut self, _: &ScrollHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow = false;
+        self.list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: Pixels::ZERO,
+        });
+        cx.notify();
+    }
+    fn on_scroll_end(&mut self, _: &ScrollEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow = true;
+        self.scroll_to_bottom();
+        cx.notify();
+    }
+    fn on_toggle_follow(&mut self, _: &ToggleFollow, _: &mut Window, cx: &mut Context<Self>) {
+        self.follow = !self.follow;
+        if self.follow {
+            self.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+    fn on_scroll_left(&mut self, _: &ScrollLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.horizontal_offset_px = (self.horizontal_offset_px - HORIZONTAL_STEP_PX).max(0.0);
+        cx.notify();
+    }
+    fn on_scroll_right(&mut self, _: &ScrollRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.horizontal_offset_px += HORIZONTAL_STEP_PX;
+        cx.notify();
+    }
+    fn on_scroll_line_start(
+        &mut self,
+        _: &ScrollLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.horizontal_offset_px = 0.0;
+        cx.notify();
     }
 }
 
@@ -391,7 +520,7 @@ impl Drop for GlowtailGpui {
 }
 
 impl Render for GlowtailGpui {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_live_events();
         let metadata = Arc::clone(&self.metadata);
         let engine = Rc::clone(&self.engine);
@@ -400,8 +529,30 @@ impl Render for GlowtailGpui {
         // below — overlapping `borrow_mut()` calls would panic with
         // `RefCell already borrowed` (review M7).
         let detail_row = engine.borrow_mut().present_row_at(0);
+        let focus_handle = self
+            .focus_handle
+            .clone()
+            .expect("focus_handle initialised in cx.new closure");
+        // Grab focus once at startup so the root div receives keyboard actions.
+        // We don't keep stealing it back so future focusable widgets still work.
+        if !self.focused_once {
+            window.focus(&focus_handle);
+            self.focused_once = true;
+        }
+        let horizontal_offset = self.horizontal_offset_px;
         div()
             .size_full()
+            .track_focus(&focus_handle)
+            .on_action(cx.listener(Self::on_scroll_up))
+            .on_action(cx.listener(Self::on_scroll_down))
+            .on_action(cx.listener(Self::on_page_up))
+            .on_action(cx.listener(Self::on_page_down))
+            .on_action(cx.listener(Self::on_scroll_home))
+            .on_action(cx.listener(Self::on_scroll_end))
+            .on_action(cx.listener(Self::on_scroll_left))
+            .on_action(cx.listener(Self::on_scroll_right))
+            .on_action(cx.listener(Self::on_scroll_line_start))
+            .on_action(cx.listener(Self::on_toggle_follow))
             .bg(rgb(0x101418))
             .text_color(rgb(0xd8dee9))
             .font_family("monospace")
@@ -410,6 +561,7 @@ impl Render for GlowtailGpui {
             .child(top_bar(
                 &metadata,
                 self.live_tail.is_some(),
+                self.follow,
                 self.status_message.as_deref(),
                 self.engine.borrow().evicted_row_count(),
             ))
@@ -419,7 +571,11 @@ impl Render for GlowtailGpui {
                     .flex_1()
                     .overflow_hidden()
                     .child(source_sidebar(&metadata))
-                    .child(log_viewport(engine, self.list_state.clone()))
+                    .child(log_viewport(
+                        engine,
+                        self.list_state.clone(),
+                        horizontal_offset,
+                    ))
                     .child(detail_panel(detail_row)),
             )
             .child(timeline_panel(&metadata))
@@ -429,12 +585,24 @@ impl Render for GlowtailGpui {
 fn top_bar(
     snapshot: &ViewportSnapshot,
     live_tail_enabled: bool,
+    follow: bool,
     status_message: Option<&str>,
     evicted_count: u64,
 ) -> impl IntoElement {
     let mode = if live_tail_enabled { "live" } else { "static" };
+    let follow_label = if !live_tail_enabled {
+        "—"
+    } else if follow {
+        "on"
+    } else {
+        "off"
+    };
     let status = status_message.unwrap_or(if live_tail_enabled {
-        "following appended lines"
+        if follow {
+            "following appended lines"
+        } else {
+            "paused — press End or f to follow"
+        }
     } else {
         "loaded once"
     });
@@ -462,7 +630,8 @@ fn top_bar(
             "error",
             snapshot.level_counts.error + snapshot.level_counts.fatal,
         ))
-        .child(metric_text("mode", mode));
+        .child(metric_text("mode", mode))
+        .child(metric_text("follow", follow_label));
 
     if evicted_count > 0 {
         bar = bar.child(
@@ -537,7 +706,11 @@ fn source_sidebar(snapshot: &ViewportSnapshot) -> impl IntoElement {
     panel
 }
 
-fn log_viewport(engine: Rc<RefCell<Engine>>, list_state: ListState) -> impl IntoElement {
+fn log_viewport(
+    engine: Rc<RefCell<Engine>>,
+    list_state: ListState,
+    horizontal_offset: f32,
+) -> impl IntoElement {
     div()
         .flex_1()
         .h_full()
@@ -559,51 +732,42 @@ fn log_viewport(engine: Rc<RefCell<Engine>>, list_state: ListState) -> impl Into
         .child(
             list(list_state, move |index, _window, _cx| {
                 let row = engine.borrow_mut().present_row_at(index);
-                row_element(row, index)
+                row_element(row, index, horizontal_offset)
             })
             .flex_1(),
         )
 }
 
-fn row_element(row: Option<RowPresentation>, index: usize) -> gpui::AnyElement {
+fn row_element(
+    row: Option<RowPresentation>,
+    index: usize,
+    horizontal_offset: f32,
+) -> gpui::AnyElement {
     let Some(row) = row else {
         return div().h(px(24.)).into_any();
     };
 
-    let mut line = div()
-        .h(px(24.))
-        .w_full()
+    // Inner content div absorbs the horizontal offset via negative left margin;
+    // the outer line's `w_full()` plus the parent's `overflow_hidden()` clip
+    // anything shifted past the viewport edges.
+    let mut content = div()
         .flex()
         .items_center()
         .gap_1()
-        .px_2()
-        .border_b_1()
-        .border_color(rgb(0x1c2530))
-        .bg(if index.is_multiple_of(2) {
-            rgb(0x10161d)
-        } else {
-            rgb(0x0d1117)
-        })
-        .child(
-            div()
-                .w(px(4.))
-                .h_full()
-                .bg(severity_color(row.severity_role()))
-                .mr_2(),
-        );
+        .ml(px(-horizontal_offset));
 
     if row.is_bookmarked {
-        line = line.child(div().text_color(rgb(0xdc8cff)).child("*"));
+        content = content.child(div().text_color(rgb(0xdc8cff)).child("*"));
     }
     if row.folded_stack_rows > 0 {
-        line = line.child(
+        content = content.child(
             div()
                 .text_color(rgb(0x8b949e))
                 .child(format!("+{} ", row.folded_stack_rows)),
         );
     }
     if let Some(source) = row.source_name.as_ref() {
-        line = line.child(
+        content = content.child(
             div()
                 .text_color(rgb(0x8b949e))
                 .child(format!("[{source}] ")),
@@ -617,10 +781,33 @@ fn row_element(row: Option<RowPresentation>, index: usize) -> gpui::AnyElement {
         if span.kind == SpanKind::SearchMatch {
             span_div = span_div.bg(rgb(0xc9d96f));
         }
-        line = line.child(span_div);
+        content = content.child(span_div);
     }
 
-    line.into_any()
+    div()
+        .h(px(24.))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .border_b_1()
+        .border_color(rgb(0x1c2530))
+        .overflow_hidden()
+        .bg(if index.is_multiple_of(2) {
+            rgb(0x10161d)
+        } else {
+            rgb(0x0d1117)
+        })
+        .child(
+            div()
+                .w(px(4.))
+                .h_full()
+                .bg(severity_color(row.severity_role()))
+                .mr_2(),
+        )
+        .child(content)
+        .into_any()
 }
 
 fn detail_panel(selected: Option<RowPresentation>) -> impl IntoElement {

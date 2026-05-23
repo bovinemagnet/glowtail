@@ -72,6 +72,46 @@ By default the GPUI app follows appended lines through the shared `glowtail-core
 
 The GPUI prototype currently has no in-app filter, search, command palette, or row-selection controls — drive it via CLI flags and the session file. The GUI (`glowtail-gui`) is the front-end with full interactive controls.
 
+### Tailing a log file with glowtail-gpui
+
+The GPUI front-end follows appended lines by default — point it at a log file and new lines stream in live through the shared `glowtail-core` tailer:
+
+```bash
+# Follow a single log file as new lines are appended (default behaviour)
+cargo run -p glowtail-gpui -- /var/log/myapp.log
+
+# Follow several files at once — each appears in the source sidebar
+cargo run -p glowtail-gpui -- /var/log/app/server.log /var/log/app/worker.log
+
+# Replay existing content through the tailer, then keep following new lines
+cargo run -p glowtail-gpui -- /var/log/myapp.log --from-start
+
+# Tail and only show rows at warn level or above
+cargo run -p glowtail-gpui -- /var/log/myapp.log --level warn
+
+# Tail and narrow to lines containing a token (case-insensitive substring)
+cargo run -p glowtail-gpui -- /var/log/myapp.log --filter timeout
+
+# Tail a JSON-lines log with a field-aware query filter
+cargo run -p glowtail-gpui -- /var/log/myapp.jsonl --json \
+  --filter 'service = "billing" and level >= error'
+
+# Cap the in-memory ring buffer so long-running tails don't grow unbounded
+cargo run -p glowtail-gpui -- /var/log/myapp.log --max-rows 50000
+
+# Re-use a saved filter from a session while tailing
+cargo run -p glowtail-gpui -- /var/log/myapp.log \
+  --session .glowtail-gpui-session.json --use-filter warnings
+
+# One-shot snapshot of current content, no follow
+cargo run -p glowtail-gpui -- /var/log/myapp.log --no-follow
+
+# Reproduce a tail against a sample log shipped with the repo
+cargo run -p glowtail-gpui -- samples/mixed.log --from-start --level warn
+```
+
+`--no-follow` preloads the file once and stops; `--from-start` is the right choice when you want the live tailer to replay current content before streaming new lines (useful when an active writer is rotating the file out from under you).
+
 ## Following and Existing Content
 
 By default, commands follow files for appended lines. Add `--no-follow` for one-shot reads that exit after current content is processed.
