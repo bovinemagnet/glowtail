@@ -34,6 +34,11 @@ struct Args {
     use_filter: Option<String>,
     #[arg(long)]
     save_filter: Option<String>,
+    /// Retain at most this many rows; older rows are dropped from the front
+    /// of the buffer when the cap is exceeded. `0` means unbounded (default).
+    /// Recommended when tailing high-volume files for a long time.
+    #[arg(long)]
+    max_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -50,17 +55,22 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let session = load_session(args.session.as_ref())?;
     let parser = parser_from_flags(args.json, args.plain);
+    // Accumulate per-path errors instead of returning the first failure so a
+    // single unreadable path doesn't prevent the GUI from launching with the
+    // rows it *could* load. Errors are surfaced as the initial status message.
+    let mut load_errors: Vec<String> = Vec::new();
     let mut engine = if !args.no_follow && args.from_start {
         Engine::with_session(session)
     } else {
         let mut engine = Engine::with_session(session);
         for path in &args.paths {
-            engine
-                .load_file(path, parser.as_ref())
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            if let Err(err) = engine.load_file(path, parser.as_ref()) {
+                load_errors.push(format!("failed to read {}: {err}", path.display()));
+            }
         }
         engine
     };
+    engine.set_max_rows(normalise_max_rows(args.max_rows));
     apply_filters(
         &mut engine,
         args.filter.clone(),
@@ -93,6 +103,12 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let initial_status = if load_errors.is_empty() {
+        None
+    } else {
+        Some(load_errors.join("; "))
+    };
+
     eframe::run_native(
         "glowtail",
         options,
@@ -103,10 +119,20 @@ fn main() -> Result<()> {
                 args.session,
                 runtime,
                 live_tail,
+                initial_status,
             )))
         }),
     )
     .map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+/// Treat `--max-rows 0` and an absent flag as "unbounded" so the surface is
+/// forgiving — `0` reading as "no rows retained" is a usability trap.
+fn normalise_max_rows(value: Option<usize>) -> Option<usize> {
+    match value {
+        Some(0) | None => None,
+        other => other,
+    }
 }
 
 fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
@@ -150,7 +176,7 @@ fn start_tailers(
     parser: Arc<dyn LogParser>,
     from_start: bool,
 ) -> LiveTail {
-    let (tx, rx) = mpsc::channel(1024);
+    let (tx, rx) = mpsc::channel(DEFAULT_TAILER_CHANNEL_CAPACITY);
     let mut tailers = Vec::new();
     let _guard = runtime.enter();
     for (index, path) in paths.iter().enumerate() {
@@ -224,6 +250,10 @@ struct GlowtailGui {
     fold_stacks: bool,
     follow: bool,
     session_path: Option<PathBuf>,
+    /// Kept alive to host the spawned `FileTailer` tasks. Not read after
+    /// construction — `Drop` order ensures it outlives `live_tail`, so the
+    /// runtime drives the tasks to completion after `signal_stop` (M5).
+    #[allow(dead_code)]
     runtime: Runtime,
     live_tail: Option<LiveTail>,
     status_message: Option<String>,
@@ -238,6 +268,7 @@ impl GlowtailGui {
         session_path: Option<PathBuf>,
         runtime: Runtime,
         live_tail: Option<LiveTail>,
+        status_message: Option<String>,
     ) -> Self {
         Self {
             engine,
@@ -251,7 +282,7 @@ impl GlowtailGui {
             session_path,
             runtime,
             live_tail,
-            status_message: None,
+            status_message,
             saved_filter_name: String::new(),
             scroll_to_row: None,
         }
@@ -434,6 +465,14 @@ impl GlowtailGui {
                         "{} matching / {} total",
                         snapshot.total_matching_rows, snapshot.total_rows
                     ));
+                    let evicted = self.engine.evicted_row_count();
+                    if evicted > 0 {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(214, 163, 61),
+                            format!("truncated: {evicted} oldest rows dropped"),
+                        );
+                    }
                     ui.separator();
                     ui.label(format!("warn {}", snapshot.level_counts.warn));
                     ui.label(format!(
@@ -490,7 +529,13 @@ impl GlowtailGui {
             let total_matching_rows = self.engine.matching_rows_count();
             let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
             if self.follow && total_matching_rows > 0 {
-                scroll = scroll.vertical_scroll_offset(total_matching_rows as f32 * ROW_HEIGHT);
+                // Scroll so the last row sits at the bottom of the viewport
+                // rather than one row past the bottom edge. The previous
+                // `total * ROW_HEIGHT` placed the row *after* the last at
+                // the top, leaving an empty band beneath the data.
+                let viewport_h = ui.available_height();
+                let needed = (total_matching_rows as f32 * ROW_HEIGHT - viewport_h).max(0.0);
+                scroll = scroll.vertical_scroll_offset(needed);
             } else if let Some(row) = self.scroll_to_row.take() {
                 scroll = scroll.vertical_scroll_offset(row as f32 * ROW_HEIGHT);
             }
@@ -657,6 +702,7 @@ impl GlowtailGui {
                     self.status_message = Some(format!("source {} error: {message}", source_id.0));
                 }
                 Ok(LogEvent::SourceRemoved { .. }) => {}
+                Ok(_) => {}
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.status_message = Some("live tail disconnected".into());
@@ -788,6 +834,15 @@ impl GlowtailGui {
     }
 }
 
+/// Polling cadence for draining the live-tail channel while a tailer is
+/// active. 100ms ≈ 10 Hz — fast enough to feel live, slow enough to coalesce
+/// bursts of appends into one frame instead of re-rendering per row.
+const LIVE_POLL_INTERVAL_MS: u64 = 100;
+/// Polling cadence when there's no active live tail. egui already repaints
+/// on input; this is just a slow heartbeat so e.g. status TTL has a chance
+/// to fire. Slower polling here saves idle CPU.
+const IDLE_POLL_INTERVAL_MS: u64 = 1000;
+
 impl eframe::App for GlowtailGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain incoming events first so the follow-mode scroll target below
@@ -802,16 +857,29 @@ impl eframe::App for GlowtailGui {
         self.timeline_panel(ctx, &metadata);
         self.log_viewport(ctx);
         self.command_palette(ctx);
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Coalesce repaints: only run the fast polling loop while there's a
+        // live tail to drain. Idle sessions repaint on input plus a slow
+        // heartbeat. The previous unconditional 100ms heartbeat burned CPU
+        // on static logs even when nothing changed.
+        let next_poll_ms = if self.live_tail.is_some() {
+            LIVE_POLL_INTERVAL_MS
+        } else {
+            IDLE_POLL_INTERVAL_MS
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(next_poll_ms));
     }
 }
 
 impl Drop for GlowtailGui {
     fn drop(&mut self) {
         self.save_session();
-        if let Some(mut live_tail) = self.live_tail.take() {
-            for tailer in live_tail.tailers.drain(..) {
-                self.runtime.block_on(tailer.stop());
+        // Don't `block_on(stop())` here — that blocks the UI thread on
+        // shutdown and panics when invoked from inside a Tokio worker. Flip
+        // the per-tailer stop flag and let the runtime drive the spawned
+        // tasks to completion when the runtime itself is dropped below.
+        if let Some(live_tail) = self.live_tail.take() {
+            for tailer in &live_tail.tailers {
+                tailer.signal_stop();
             }
         }
     }

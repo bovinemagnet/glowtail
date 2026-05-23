@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
             session,
             use_filter,
             save_filter,
+            max_rows,
         } => {
             run_tail(TailRun {
                 paths,
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
                 session,
                 use_filter,
                 save_filter,
+                max_rows: normalise_max_rows(max_rows),
             })
             .await
         }
@@ -48,6 +50,7 @@ async fn main() -> Result<()> {
             session,
             use_filter,
             save_filter,
+            max_rows,
         } => {
             let parser = parser_from_flags(json, plain);
             let follow = !no_follow;
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
             } else {
                 load_initial_engine(paths.clone(), Arc::clone(&parser), investigation).await?
             };
+            engine.set_max_rows(normalise_max_rows(max_rows));
             apply_filters_and_save(
                 &mut engine,
                 &filter,
@@ -66,7 +70,7 @@ async fn main() -> Result<()> {
             )?;
 
             let engine = if follow {
-                let (tx, rx) = mpsc::channel(1024);
+                let (tx, rx) = mpsc::channel(DEFAULT_TAILER_CHANNEL_CAPACITY);
                 let mut tailers = Vec::new();
                 for (idx, path) in paths.into_iter().enumerate() {
                     let source_id = SourceId((idx + 1) as u64);
@@ -134,6 +138,18 @@ struct TailRun {
     session: Option<PathBuf>,
     use_filter: Option<String>,
     save_filter: Option<String>,
+    max_rows: Option<usize>,
+}
+
+/// Treat `--max-rows 0` and a missing flag as "unbounded" so the CLI surface
+/// is forgiving: `--max-rows 0` reads as "no cap" rather than "drop every row
+/// as soon as it arrives". Engine-side `set_max_rows(None)` is the unbounded
+/// path.
+fn normalise_max_rows(value: Option<usize>) -> Option<usize> {
+    match value {
+        Some(0) | None => None,
+        other => other,
+    }
 }
 
 async fn run_tail(options: TailRun) -> Result<()> {
@@ -144,9 +160,8 @@ async fn run_tail(options: TailRun) -> Result<()> {
 }
 
 async fn run_tail_follow(options: TailRun) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(1024);
+    let (tx, mut rx) = mpsc::channel(DEFAULT_TAILER_CHANNEL_CAPACITY);
     let mut tailers = Vec::new();
-    let source_count = options.paths.len();
 
     for (idx, path) in options.paths.into_iter().enumerate() {
         tailers.push(FileTailer::start(
@@ -162,6 +177,7 @@ async fn run_tail_follow(options: TailRun) -> Result<()> {
 
     let investigation = load_session(options.session.as_ref())?;
     let mut engine = Engine::with_session(investigation);
+    engine.set_max_rows(options.max_rows);
     let filter_expr = apply_filters_and_save(
         &mut engine,
         &options.filter_text,
@@ -170,8 +186,10 @@ async fn run_tail_follow(options: TailRun) -> Result<()> {
         options.save_filter,
     )?;
     let compiled_filter = glowtail_core::filter::CompiledFilter::compile(&filter_expr)?;
-    let mut removed_sources = 0usize;
 
+    // In follow mode the loop exits when every tailer's `tx` clone has been
+    // dropped (i.e. every spawned task ended). `SourceRemoved` is informational
+    // here — we count on the channel-close semantics for termination.
     while let Some(event) = rx.recv().await {
         match event {
             LogEvent::RowAppended(row) => {
@@ -180,12 +198,6 @@ async fn run_tail_follow(options: TailRun) -> Result<()> {
                 engine.append_row(row);
                 if should_print {
                     println!("{raw}");
-                }
-            }
-            LogEvent::SourceRemoved { .. } => {
-                removed_sources += 1;
-                if removed_sources >= source_count {
-                    break;
                 }
             }
             LogEvent::SourceError { message, .. } => eprintln!("source error: {message}"),
@@ -205,6 +217,7 @@ async fn run_tail_no_follow(options: TailRun) -> Result<()> {
     let investigation = load_session(options.session.as_ref())?;
     let mut engine =
         load_initial_engine(options.paths, Arc::clone(&options.parser), investigation).await?;
+    engine.set_max_rows(options.max_rows);
     let filter_expr = apply_filters_and_save(
         &mut engine,
         &options.filter_text,

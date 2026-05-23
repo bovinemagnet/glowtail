@@ -42,6 +42,10 @@ struct Args {
     use_filter: Option<String>,
     #[arg(long)]
     save_filter: Option<String>,
+    /// Retain at most this many rows; older rows are dropped from the front
+    /// of the buffer when the cap is exceeded. `0` means unbounded (default).
+    #[arg(long)]
+    max_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -59,13 +63,17 @@ fn main() -> Result<()> {
     let parser = parser_from_flags(args.json, args.plain);
     let session = load_session(args.session.as_ref())?;
     let mut engine = Engine::with_session(session);
+    // Accumulate per-path load errors so a single unreadable file doesn't
+    // prevent the window from opening on the readable ones.
+    let mut load_errors: Vec<String> = Vec::new();
     if args.no_follow || !args.from_start {
         for path in &args.paths {
-            engine
-                .load_file(path, parser.as_ref())
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            if let Err(err) = engine.load_file(path, parser.as_ref()) {
+                load_errors.push(format!("failed to read {}: {err}", path.display()));
+            }
         }
     }
+    engine.set_max_rows(normalise_max_rows(args.max_rows));
     apply_filters(
         &mut engine,
         args.filter.clone(),
@@ -89,7 +97,12 @@ fn main() -> Result<()> {
             args.from_start,
         ))
     };
-    let app = GlowtailGpui::new(engine, runtime, live_tail, args.session);
+    let initial_status = if load_errors.is_empty() {
+        None
+    } else {
+        Some(load_errors.join("; "))
+    };
+    let app = GlowtailGpui::new(engine, runtime, live_tail, args.session, initial_status);
 
     let launch_error: Arc<std::sync::Mutex<Option<anyhow::Error>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -129,7 +142,7 @@ fn start_tailers(
     parser: Arc<dyn LogParser>,
     from_start: bool,
 ) -> LiveTail {
-    let (tx, rx) = mpsc::channel(1024);
+    let (tx, rx) = mpsc::channel(DEFAULT_TAILER_CHANNEL_CAPACITY);
     let mut tailers = Vec::new();
     let _guard = runtime.enter();
     for (index, path) in paths.iter().enumerate() {
@@ -146,6 +159,15 @@ fn start_tailers(
     LiveTail {
         receiver: rx,
         tailers,
+    }
+}
+
+/// Treat `--max-rows 0` and an absent flag as "unbounded" so the CLI surface
+/// is forgiving — `0` reading as "no rows retained" is a usability trap.
+fn normalise_max_rows(value: Option<usize>) -> Option<usize> {
+    match value {
+        Some(0) | None => None,
+        other => other,
     }
 }
 
@@ -234,6 +256,10 @@ struct GlowtailGpui {
     engine: Rc<RefCell<Engine>>,
     metadata: Arc<ViewportSnapshot>,
     list_state: ListState,
+    /// Kept alive to host the spawned `FileTailer` tasks. Not read after
+    /// construction — `Drop` order ensures it outlives `live_tail`, so the
+    /// runtime drives the tasks to completion after `signal_stop` (M5).
+    #[allow(dead_code)]
     runtime: Runtime,
     live_tail: Option<LiveTail>,
     status_message: Option<String>,
@@ -246,6 +272,7 @@ impl GlowtailGpui {
         runtime: Runtime,
         live_tail: Option<LiveTail>,
         session_path: Option<PathBuf>,
+        status_message: Option<String>,
     ) -> Self {
         let engine = Rc::new(RefCell::new(engine));
         let (metadata, item_count) = {
@@ -261,7 +288,7 @@ impl GlowtailGpui {
             list_state,
             runtime,
             live_tail,
-            status_message: None,
+            status_message,
             session_path,
         }
     }
@@ -311,6 +338,7 @@ impl GlowtailGpui {
                     self.status_message = Some(format!("source {} error: {message}", source_id.0));
                 }
                 Ok(LogEvent::SourceRemoved { .. }) => {}
+                Ok(_) => {}
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.status_message = Some("live tail disconnected".into());
@@ -351,9 +379,12 @@ impl GlowtailGpui {
 impl Drop for GlowtailGpui {
     fn drop(&mut self) {
         self.save_session();
-        if let Some(mut live_tail) = self.live_tail.take() {
-            for tailer in live_tail.tailers.drain(..) {
-                self.runtime.block_on(tailer.stop());
+        // Non-blocking shutdown: signal each tailer and let the runtime drop
+        // drive the spawned tasks to completion. The previous `block_on`
+        // blocked the UI thread and panics when called from a Tokio worker.
+        if let Some(live_tail) = self.live_tail.take() {
+            for tailer in &live_tail.tailers {
+                tailer.signal_stop();
             }
         }
     }
@@ -364,6 +395,11 @@ impl Render for GlowtailGpui {
         self.drain_live_events();
         let metadata = Arc::clone(&self.metadata);
         let engine = Rc::clone(&self.engine);
+        // Snapshot the detail row up front so `detail_panel` doesn't borrow
+        // the engine concurrently with the lazy list-row render closures
+        // below — overlapping `borrow_mut()` calls would panic with
+        // `RefCell already borrowed` (review M7).
+        let detail_row = engine.borrow_mut().present_row_at(0);
         div()
             .size_full()
             .bg(rgb(0x101418))
@@ -375,6 +411,7 @@ impl Render for GlowtailGpui {
                 &metadata,
                 self.live_tail.is_some(),
                 self.status_message.as_deref(),
+                self.engine.borrow().evicted_row_count(),
             ))
             .child(
                 div()
@@ -382,8 +419,8 @@ impl Render for GlowtailGpui {
                     .flex_1()
                     .overflow_hidden()
                     .child(source_sidebar(&metadata))
-                    .child(log_viewport(engine.clone(), self.list_state.clone()))
-                    .child(detail_panel(engine)),
+                    .child(log_viewport(engine, self.list_state.clone()))
+                    .child(detail_panel(detail_row)),
             )
             .child(timeline_panel(&metadata))
     }
@@ -393,6 +430,7 @@ fn top_bar(
     snapshot: &ViewportSnapshot,
     live_tail_enabled: bool,
     status_message: Option<&str>,
+    evicted_count: u64,
 ) -> impl IntoElement {
     let mode = if live_tail_enabled { "live" } else { "static" };
     let status = status_message.unwrap_or(if live_tail_enabled {
@@ -401,7 +439,7 @@ fn top_bar(
         "loaded once"
     });
 
-    div()
+    let mut bar = div()
         .h(px(52.))
         .w_full()
         .flex()
@@ -424,14 +462,24 @@ fn top_bar(
             "error",
             snapshot.level_counts.error + snapshot.level_counts.fatal,
         ))
-        .child(metric_text("mode", mode))
-        .child(
+        .child(metric_text("mode", mode));
+
+    if evicted_count > 0 {
+        bar = bar.child(
             div()
-                .ml_auto()
                 .text_sm()
-                .text_color(rgb(0x9aa7b2))
-                .child(status.to_string()),
-        )
+                .text_color(rgb(0xd6a33d))
+                .child(format!("truncated: -{evicted_count}")),
+        );
+    }
+
+    bar.child(
+        div()
+            .ml_auto()
+            .text_sm()
+            .text_color(rgb(0x9aa7b2))
+            .child(status.to_string()),
+    )
 }
 
 fn metric(label: &'static str, value: usize) -> impl IntoElement {
@@ -575,11 +623,11 @@ fn row_element(row: Option<RowPresentation>, index: usize) -> gpui::AnyElement {
     line.into_any()
 }
 
-fn detail_panel(engine: Rc<RefCell<Engine>>) -> impl IntoElement {
+fn detail_panel(selected: Option<RowPresentation>) -> impl IntoElement {
     // Show the first visible row's details. Without a click handler in
     // gpui 0.2.2, the prototype settles for "first row" semantics that match
-    // the previous behaviour.
-    let selected = engine.borrow_mut().present_row_at(0);
+    // the previous behaviour. The row is snapshotted in the parent `render`
+    // so this function doesn't borrow the engine — see review M7.
     let mut panel = div()
         .w(px(320.))
         .h_full()

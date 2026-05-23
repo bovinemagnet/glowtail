@@ -2,6 +2,7 @@ use crate::model::{LogRow, SourceId};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum LogEvent {
     SourceAdded {
         source_id: SourceId,

@@ -1,4 +1,4 @@
-use crate::filter::{CompiledFilter, FilterExpr};
+use crate::filter::{CompiledFilter, FilterExpr, contains_ascii_ci};
 use crate::index::RowIndex;
 use crate::model::{
     ByteRange, LevelCounts, LogLevel, LogRow, LogSourceKind, RowId, RowPresentation, SourceId,
@@ -28,6 +28,18 @@ pub struct Engine {
     /// current filter, sorted by `(timestamp, row_id)`. Built lazily and
     /// invalidated by any mutation that could change which rows pass.
     filtered_positions: Option<Vec<usize>>,
+    /// Cached `RowId`s matching the current search text (in filtered order).
+    /// Built lazily on the first `search_results()` call and invalidated by
+    /// any change to the search text, the filter, or the row set. Avoids the
+    /// O(n) re-lowercasing-and-substring-scan that the TUI previously paid
+    /// per `n`/`N` keystroke (see review H1, 2026-05-23).
+    search_cache: Option<Vec<RowId>>,
+    /// Opt-in cap on the number of retained rows. When the cap is exceeded
+    /// after an append, the oldest rows are dropped from `RowIndex` and the
+    /// filter/search caches are shifted accordingly. `None` means "keep
+    /// everything", which is the default and correct for investigations.
+    /// Live-tail use cases (`tail -f`-style) set this to bound memory.
+    max_rows: Option<usize>,
 }
 
 impl Engine {
@@ -58,9 +70,152 @@ impl Engine {
                 kind: LogSourceKind::Other(Arc::from("unknown")),
             });
         self.index.append(row);
-        // A single append may shift sort order arbitrarily once timestamps are
-        // involved, so the cache is dropped wholesale rather than patched.
-        self.invalidate_cache();
+        self.try_incremental_cache_update();
+        self.enforce_max_rows();
+    }
+
+    /// Set or clear the opt-in cap on retained rows. When `max` is `Some(n)`
+    /// and the current row count exceeds `n`, the oldest rows are evicted
+    /// immediately so callers can configure this at any point. `None`
+    /// restores the unbounded default. The cap is *not* persisted to the
+    /// session file — it's a runtime setting chosen per UI launch.
+    pub fn set_max_rows(&mut self, max: Option<usize>) {
+        self.max_rows = max;
+        self.enforce_max_rows();
+    }
+
+    pub fn max_rows(&self) -> Option<usize> {
+        self.max_rows
+    }
+
+    /// Number of rows dropped from the front of the index across this
+    /// engine's lifetime. UIs use this to show a "truncated above" badge so
+    /// the user knows history beyond the window is no longer available.
+    pub fn evicted_row_count(&self) -> u64 {
+        self.index.evicted_count()
+    }
+
+    fn enforce_max_rows(&mut self) {
+        let Some(max) = self.max_rows else {
+            return;
+        };
+        let total = self.index.len();
+        if total <= max {
+            return;
+        }
+        let evict = total - max;
+        let evicted = self.index.evict_oldest(evict);
+        if evicted == 0 {
+            return;
+        }
+        // Shift `filtered_positions` to track the new Vec layout. Positions
+        // below `evicted` referred to now-dropped rows; the rest shift down.
+        if let Some(positions) = self.filtered_positions.as_mut() {
+            positions.retain(|&p| p >= evicted);
+            for p in positions.iter_mut() {
+                *p -= evicted;
+            }
+        }
+        // `search_cache` stores RowIds, which are stable across eviction —
+        // but IDs for evicted rows no longer resolve. Drop them so the cache
+        // doesn't grow unbounded with stale entries.
+        if let Some(cache) = self.search_cache.as_mut() {
+            let index = &self.index;
+            cache.retain(|&id| index.position_of(id).is_some());
+        }
+    }
+
+    /// Update `filtered_positions` and `search_cache` for the row that was
+    /// just appended at `self.index.len() - 1`, instead of dropping both
+    /// caches wholesale. For monotonic-timestamp tails the common case is
+    /// `positions.push(...)`; out-of-order arrivals fall back to a
+    /// binary-search insort. If either cache hasn't been built yet, leave it
+    /// alone — the lazy `ensure_*_cache` path will build it correctly on
+    /// next demand. This turns the previous O(n) per-append rebuild into
+    /// O(log n) (or O(1) for ordered tails).
+    fn try_incremental_cache_update(&mut self) {
+        let total = self.index.len();
+        if total == 0 {
+            return;
+        }
+        let new_position = total - 1;
+        let raw = self.index.rows();
+        let new_row = &raw[new_position];
+
+        let passes_filter = self.compiled_filter.matches(new_row);
+        let passes_stack =
+            !self.collapse_stack_traces || !Self::is_stack_trace_continuation(new_row);
+        if !passes_filter || !passes_stack {
+            return;
+        }
+
+        let new_ts = new_row.timestamp;
+        let new_id = new_row.row_id;
+
+        if let Some(positions) = self.filtered_positions.as_mut() {
+            let needs_insort = positions
+                .last()
+                .map(|&last_pos| {
+                    let last = &raw[last_pos];
+                    (last.timestamp, last.row_id) > (new_ts, new_id)
+                })
+                .unwrap_or(false);
+            if needs_insort {
+                let insert_at = positions
+                    .binary_search_by(|&probe| {
+                        let r = &raw[probe];
+                        (r.timestamp, r.row_id).cmp(&(new_ts, new_id))
+                    })
+                    .unwrap_or_else(|e| e);
+                positions.insert(insert_at, new_position);
+            } else {
+                positions.push(new_position);
+            }
+        }
+
+        // Search cache mirrors the filter cache's order but stores `RowId`s.
+        // Only update if the search is active and the new row contains the
+        // (already lowercased) needle.
+        if self.search_cache.is_some()
+            && let Some(search) = self.search_text.as_ref()
+        {
+            let needle = search.to_ascii_lowercase();
+            if contains_ascii_ci(new_row.raw.as_ref(), &needle) {
+                // Look up sort positions through the index so we can insort
+                // by the same (timestamp, row_id) key. Resolve each probe's
+                // sort key once via `position_of` to keep the borrow scoped.
+                let index = &self.index;
+                if let Some(cache) = self.search_cache.as_mut() {
+                    let needs_insort = cache
+                        .last()
+                        .and_then(|&last_id| {
+                            index
+                                .position_of(last_id)
+                                .map(|pos| (raw[pos].timestamp, raw[pos].row_id))
+                        })
+                        .map(|key| key > (new_ts, new_id))
+                        .unwrap_or(false);
+                    if needs_insort {
+                        let insert_at = cache
+                            .binary_search_by(|&probe| {
+                                match index.position_of(probe) {
+                                    Some(pos) => {
+                                        (raw[pos].timestamp, raw[pos].row_id).cmp(&(new_ts, new_id))
+                                    }
+                                    // Stale RowId (evicted row, if retention
+                                    // is bounded): treat as "less" so it
+                                    // remains at the front of the cache.
+                                    None => std::cmp::Ordering::Less,
+                                }
+                            })
+                            .unwrap_or_else(|e| e);
+                        cache.insert(insert_at, new_id);
+                    } else {
+                        cache.push(new_id);
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_filter(&mut self, filter: FilterExpr) -> Result<(), crate::filter::FilterError> {
@@ -78,7 +233,11 @@ impl Engine {
     }
 
     pub fn set_search_text(&mut self, search_text: Option<String>) {
-        self.search_text = search_text.filter(|text| !text.is_empty());
+        let normalised = search_text.filter(|text| !text.is_empty());
+        if normalised != self.search_text {
+            self.search_text = normalised;
+            self.search_cache = None;
+        }
     }
 
     pub fn set_stack_trace_folding(&mut self, enabled: bool) {
@@ -229,6 +388,9 @@ impl Engine {
 
     fn invalidate_cache(&mut self) {
         self.filtered_positions = None;
+        // Search results depend on the filtered set, so any change that
+        // touches the filter cache also invalidates the search cache.
+        self.search_cache = None;
     }
 
     pub fn filtered_position_for_row(&mut self, row_id: RowId) -> Option<usize> {
@@ -240,32 +402,13 @@ impl Engine {
     }
 
     pub fn search_results(&mut self) -> Vec<RowId> {
-        let Some(search) = self.search_text.clone() else {
-            return Vec::new();
-        };
-        let search = search.to_ascii_lowercase();
-        self.ensure_cache();
-        let raw = self.index.rows();
-        self.filtered_positions
-            .as_ref()
-            .map(|positions| {
-                positions
-                    .iter()
-                    .filter_map(|position| {
-                        let row = &raw[*position];
-                        if row.raw.to_ascii_lowercase().contains(&search) {
-                            Some(row.row_id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.ensure_search_cache();
+        self.search_cache.clone().unwrap_or_default()
     }
 
     pub fn next_search_result(&mut self, current: Option<RowId>, reverse: bool) -> Option<RowId> {
-        let results = self.search_results();
+        self.ensure_search_cache();
+        let results = self.search_cache.as_ref()?;
         if results.is_empty() {
             return None;
         }
@@ -282,11 +425,46 @@ impl Engine {
             .iter()
             .position(|row_id| *row_id == current)
             .unwrap_or(0);
+        let len = results.len();
         if reverse {
-            Some(results[(position + results.len() - 1) % results.len()])
+            Some(results[(position + len - 1) % len])
         } else {
-            Some(results[(position + 1) % results.len()])
+            Some(results[(position + 1) % len])
         }
+    }
+
+    /// Populate `search_cache` from the current search text and filtered
+    /// row set. Cheap when the cache is already valid; rebuilds without
+    /// allocating a fresh lowercased needle and row haystacks per call.
+    fn ensure_search_cache(&mut self) {
+        if self.search_cache.is_some() {
+            return;
+        }
+        let Some(search) = self.search_text.as_ref() else {
+            self.search_cache = Some(Vec::new());
+            return;
+        };
+        let needle = search.to_ascii_lowercase();
+        self.ensure_cache();
+        let raw = self.index.rows();
+        let results = self
+            .filtered_positions
+            .as_ref()
+            .map(|positions| {
+                positions
+                    .iter()
+                    .filter_map(|position| {
+                        let row = &raw[*position];
+                        if contains_ascii_ci(row.raw.as_ref(), &needle) {
+                            Some(row.row_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.search_cache = Some(results);
     }
 
     /// Snapshot containing `before` rows before and `after` rows after the
@@ -795,6 +973,148 @@ mod tests {
         assert_eq!(snapshot.rows[0].row_id.0, 2);
         assert!(snapshot.has_more_before);
         assert!(snapshot.has_more_after);
+    }
+
+    #[test]
+    fn incremental_cache_handles_ordered_and_out_of_order_appends() {
+        // Review perf P1: monotonic-timestamp tails should `push`; out-of-order
+        // arrivals must insort to preserve the (timestamp, row_id) order that
+        // `viewport()` relies on.
+        let mut engine = Engine::default();
+        engine.append_row(mk_row_with_source_time(
+            0,
+            SourceId(1),
+            "2025-01-01T00:00:00Z",
+            "first",
+            None,
+        ));
+        // Build the cache once.
+        let snap = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        assert_eq!(snap.rows.len(), 1);
+
+        // Ordered append — should land at the end.
+        engine.append_row(mk_row_with_source_time(
+            1,
+            SourceId(1),
+            "2025-01-01T00:00:01Z",
+            "second",
+            None,
+        ));
+        // Out-of-order append — earlier timestamp, must insort.
+        engine.append_row(mk_row_with_source_time(
+            2,
+            SourceId(1),
+            "2024-12-31T23:59:59Z",
+            "earlier",
+            None,
+        ));
+
+        let snap = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        let ids: Vec<u64> = snap.rows.iter().map(|r| r.row_id.0).collect();
+        // Expected sort order by timestamp: "earlier" (row 2), then "first"
+        // (row 0), then "second" (row 1).
+        assert_eq!(ids, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn max_rows_evicts_oldest_and_shifts_caches() {
+        // Review perf P2: bounded retention drops oldest rows; the filtered
+        // position cache must shift, the search cache must drop stale ids,
+        // and `evicted_row_count()` must reflect the loss.
+        let mut engine = Engine::default();
+        engine.set_max_rows(Some(3));
+        for i in 0..5 {
+            engine.append_row(mk_row(i, &format!("line-{i}"), Some(LogLevel::Error)));
+        }
+        assert_eq!(engine.total_rows(), 3);
+        assert_eq!(engine.evicted_row_count(), 2);
+
+        let snap = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        let ids: Vec<u64> = snap.rows.iter().map(|r| r.row_id.0).collect();
+        // Surviving rows are 2, 3, 4 — the three most recent. RowIds are
+        // monotonic and unchanged across eviction.
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn max_rows_drops_stale_search_results_after_eviction() {
+        let mut engine = Engine::default();
+        for i in 0..5 {
+            engine.append_row(mk_row(i, &format!("needle-{i}"), None));
+        }
+        engine.set_search_text(Some("needle".into()));
+        assert_eq!(engine.search_results().len(), 5);
+
+        engine.set_max_rows(Some(2));
+        // Only the two most recent rows survive — search must mirror that.
+        let results = engine.search_results();
+        assert_eq!(results.len(), 2);
+        let surviving_ids: Vec<u64> = results.iter().map(|r| r.0).collect();
+        assert_eq!(surviving_ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn incremental_cache_skips_filtered_rows() {
+        let mut engine = Engine::default();
+        engine.append_row(mk_row(0, "info ok", Some(LogLevel::Info)));
+        engine
+            .set_filter(FilterExpr::LevelAtLeast(LogLevel::Warn))
+            .unwrap();
+        // Build cache; should be empty under the warn filter.
+        assert_eq!(engine.matching_rows_count(), 0);
+
+        engine.append_row(mk_row(1, "ERROR boom", Some(LogLevel::Error)));
+        engine.append_row(mk_row(2, "info skipped", Some(LogLevel::Info)));
+        assert_eq!(engine.matching_rows_count(), 1);
+        let snap = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        assert_eq!(snap.rows[0].row_id.0, 1);
+    }
+
+    #[test]
+    fn search_cache_invalidates_on_row_append_and_filter_change() {
+        // Review H1: `search_results` used to re-lowercase-and-scan every
+        // filtered row per call. The cached implementation must still see
+        // newly-appended rows and respect filter changes.
+        let mut engine = Engine::default();
+        engine.append_row(mk_row(0, "info ok", None));
+        engine.append_row(mk_row(1, "ERROR boom", Some(LogLevel::Error)));
+        engine.set_search_text(Some("boom".into()));
+        let first = engine.search_results();
+        assert_eq!(first, vec![RowId(1)]);
+
+        // Append a new matching row and confirm the cache picks it up.
+        engine.append_row(mk_row(2, "BOOM second", None));
+        let after_append = engine.search_results();
+        assert_eq!(after_append, vec![RowId(1), RowId(2)]);
+
+        // Narrow the filter so only the level=Error row remains.
+        engine
+            .set_filter(FilterExpr::LevelAtLeast(LogLevel::Error))
+            .unwrap();
+        let after_filter = engine.search_results();
+        assert_eq!(after_filter, vec![RowId(1)]);
+    }
+
+    #[test]
+    fn search_cache_clears_when_search_text_unset() {
+        let mut engine = Engine::default();
+        engine.append_row(mk_row(0, "needle", None));
+        engine.set_search_text(Some("needle".into()));
+        assert_eq!(engine.search_results(), vec![RowId(0)]);
+        engine.set_search_text(None);
+        assert!(engine.search_results().is_empty());
     }
 
     #[test]

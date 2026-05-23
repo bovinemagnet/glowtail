@@ -12,6 +12,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 
+/// Default capacity for the `mpsc::channel` between a `FileTailer` and a UI
+/// consumer. Picked to absorb a small burst of appended rows without blocking
+/// the tailer task; UIs that drain at a known cadence may need to raise this.
+pub const DEFAULT_TAILER_CHANNEL_CAPACITY: usize = 1024;
+
 pub struct FileTailer {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
@@ -29,12 +34,25 @@ impl FileTailer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let handle = tokio::spawn(async move {
-            let _ = sender
-                .send(LogEvent::SourceAdded {
-                    source_id,
-                    path: path.clone(),
-                })
-                .await;
+            // Sending into a closed channel means the consumer has gone away
+            // (UI exited, runtime tore down). Stop spinning instead of
+            // looping forever — flips the shared `stop` so subsequent
+            // iterations notice and break.
+            let send = |event: LogEvent| {
+                let sender = sender.clone();
+                let stop = Arc::clone(&stop_clone);
+                async move {
+                    if sender.send(event).await.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            };
+
+            send(LogEvent::SourceAdded {
+                source_id,
+                path: path.clone(),
+            })
+            .await;
 
             let mut offset = 0u64;
             let mut next_row = 0u64;
@@ -50,12 +68,11 @@ impl FileTailer {
                         let file_len = match file.metadata().await {
                             Ok(meta) => meta.len(),
                             Err(err) => {
-                                let _ = sender
-                                    .send(LogEvent::SourceError {
-                                        source_id,
-                                        message: err.to_string(),
-                                    })
-                                    .await;
+                                send(LogEvent::SourceError {
+                                    source_id,
+                                    message: err.to_string(),
+                                })
+                                .await;
                                 sleep(Duration::from_millis(250)).await;
                                 continue;
                             }
@@ -70,7 +87,7 @@ impl FileTailer {
                         // ranges as opaque history once `SourceRotated` fires.
                         if file_len < offset {
                             offset = 0;
-                            let _ = sender.send(LogEvent::SourceRotated { source_id }).await;
+                            send(LogEvent::SourceRotated { source_id }).await;
                         }
 
                         let seek_to = if initialized {
@@ -90,6 +107,9 @@ impl FileTailer {
                         let mut reader = BufReader::new(file);
                         let mut line = String::new();
                         loop {
+                            if stop_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
                             line.clear();
                             match reader.read_line(&mut line).await {
                                 Ok(0) => break,
@@ -104,27 +124,25 @@ impl FileTailer {
                                     );
                                     next_row += 1;
                                     offset = end;
-                                    let _ = sender.send(LogEvent::RowAppended(row)).await;
+                                    send(LogEvent::RowAppended(row)).await;
                                 }
                                 Err(err) => {
-                                    let _ = sender
-                                        .send(LogEvent::SourceError {
-                                            source_id,
-                                            message: err.to_string(),
-                                        })
-                                        .await;
+                                    send(LogEvent::SourceError {
+                                        source_id,
+                                        message: err.to_string(),
+                                    })
+                                    .await;
                                     break;
                                 }
                             }
                         }
                     }
                     Err(err) => {
-                        let _ = sender
-                            .send(LogEvent::SourceError {
-                                source_id,
-                                message: err.to_string(),
-                            })
-                            .await;
+                        send(LogEvent::SourceError {
+                            source_id,
+                            message: err.to_string(),
+                        })
+                        .await;
                     }
                 }
 
@@ -133,10 +151,20 @@ impl FileTailer {
                 }
                 sleep(Duration::from_millis(200)).await;
             }
-            let _ = sender.send(LogEvent::SourceRemoved { source_id }).await;
+            send(LogEvent::SourceRemoved { source_id }).await;
         });
 
         Self { stop, handle }
+    }
+
+    /// Request shutdown without waiting for the spawned task to finish.
+    /// Non-async so callers (e.g. UI `Drop` impls) can avoid `block_on`,
+    /// which would block the UI thread and panic when invoked from a
+    /// Tokio worker context. The task observes the flag on its next
+    /// iteration and exits; the runtime drives it to completion when
+    /// the runtime itself is dropped.
+    pub fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     pub async fn stop(self) {

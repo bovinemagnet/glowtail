@@ -10,6 +10,13 @@ pub struct RowId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub u64);
 
+/// Byte range into the source file's raw bytes for a single log row.
+///
+/// `start..end` includes any trailing line terminator (`\n` or `\r\n`). The
+/// text passed alongside a `ByteRange` to [`crate::parser::LogParser::parse_line`]
+/// has terminators stripped — the two are deliberately asymmetric:
+/// `ByteRange` is an anchor for seeking back into the raw file, while the
+/// parser receives the human-readable line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
     pub start: u64,

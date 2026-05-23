@@ -1,10 +1,15 @@
 use crate::filter::FilterExpr;
 use crate::model::RowId;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 
-const MAX_FILTER_HISTORY: usize = 20;
+/// Maximum number of filter expressions retained in `filter_history`. Older
+/// entries are dropped from the front of the deque (O(1)) when this cap is
+/// exceeded; the value is persisted as part of the session file but is not a
+/// public API contract.
+const MAX_FILTER_HISTORY: usize = 100;
 
 /// On-disk schema version for [`InvestigationSession`]. Bump when adding
 /// non-backwards-compatible fields and add a migration in `migrate_from`.
@@ -60,10 +65,14 @@ impl InvestigationSession {
         if matches!(filter, FilterExpr::All) || self.filter_history.last() == Some(&filter) {
             return;
         }
-        self.filter_history.push(filter);
-        if self.filter_history.len() > MAX_FILTER_HISTORY {
-            self.filter_history.remove(0);
+        // VecDeque + pop_front keeps eviction O(1); the previous Vec::remove(0)
+        // was O(n) and silently dropped the oldest entry past the cap.
+        let mut deque: VecDeque<FilterExpr> = std::mem::take(&mut self.filter_history).into();
+        deque.push_back(filter);
+        while deque.len() > MAX_FILTER_HISTORY {
+            deque.pop_front();
         }
+        self.filter_history = deque.into();
     }
 
     pub fn save_filter(&mut self, name: impl Into<Arc<str>>, filter: FilterExpr) {
@@ -152,6 +161,29 @@ mod tests {
         session.record_filter(FilterExpr::LevelAtLeast(LogLevel::Warn));
 
         assert_eq!(session.filter_history.len(), 2);
+    }
+
+    #[test]
+    fn evicts_oldest_filter_history_past_cap() {
+        let mut session = InvestigationSession::default();
+        for i in 0..(MAX_FILTER_HISTORY + 5) {
+            session.record_filter(FilterExpr::Contains(format!("term-{i}")));
+        }
+        assert_eq!(session.filter_history.len(), MAX_FILTER_HISTORY);
+        // Oldest entries (0..5) dropped via pop_front; newest survives at the back.
+        assert_eq!(
+            session.filter_history.last(),
+            Some(&FilterExpr::Contains(format!(
+                "term-{}",
+                MAX_FILTER_HISTORY + 4
+            )))
+        );
+        assert!(
+            !session
+                .filter_history
+                .iter()
+                .any(|expr| matches!(expr, FilterExpr::Contains(s) if s == "term-0"))
+        );
     }
 
     #[test]

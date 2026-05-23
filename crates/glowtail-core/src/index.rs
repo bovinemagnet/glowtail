@@ -1,23 +1,26 @@
 use crate::model::{LogRow, RowId};
 
-/// Append-only row store. Every appended row is reassigned a `RowId` equal to
-/// its position in the store; callers do not control the resulting id. This
-/// keeps `RowId` globally unique even when multiple sources each generate
-/// their own monotonic counters from zero, and lets [`position_of`] resolve
-/// any `RowId` in O(1) without a side table.
+/// Append-only row store. Every appended row is reassigned a `RowId` that
+/// equals `evicted_count + rows.len()` at append time — i.e. a globally
+/// monotonic counter that survives eviction. Resolving a `RowId` to its
+/// current Vec position therefore subtracts `evicted_count`; `RowId`s for
+/// evicted rows return `None` and stay stable in the session/bookmarks.
 #[derive(Debug, Default)]
 pub struct RowIndex {
     // Phase 1 uses Vec-backed append-only storage. The API keeps storage
     // replaceable by chunked rows, mmap offsets, or columnar metadata later.
     rows: Vec<LogRow>,
+    /// Number of rows that have been evicted from the front of `rows`. Added
+    /// to the Vec position to derive a stable monotonic `RowId`.
+    evicted: u64,
 }
 
 impl RowIndex {
-    /// Append a row. The row's `row_id` is overwritten with one matching its
-    /// position in the index; the returned id is the canonical id for the
-    /// row.
+    /// Append a row. The row's `row_id` is overwritten with the next
+    /// monotonic id (`evicted + rows.len()`); the returned id is the
+    /// canonical id for the row.
     pub fn append(&mut self, mut row: LogRow) -> RowId {
-        let id = RowId(self.rows.len() as u64);
+        let id = RowId(self.evicted + self.rows.len() as u64);
         row.row_id = id;
         self.rows.push(row);
         id
@@ -40,14 +43,13 @@ impl RowIndex {
         self.rows.iter().skip(start).take(count).collect()
     }
 
-    /// Resolve a `RowId` to its append-order position. Returns `None` if the
-    /// id is out of range. Use this in preference to a raw `row_id.0 as usize`
-    /// cast so the invariant has one place to update if it ever changes.
+    /// Resolve a `RowId` to its current Vec position. Returns `None` if the
+    /// row has been evicted or never existed.
     pub fn position_of(&self, row_id: RowId) -> Option<usize> {
-        let position = row_id.0 as usize;
-        // The store reassigns row_id == position on append, so this is a
-        // direct lookup. Verify defensively so a future deviation breaks tests
-        // instead of silently returning the wrong row.
+        if row_id.0 < self.evicted {
+            return None;
+        }
+        let position = (row_id.0 - self.evicted) as usize;
         let row = self.rows.get(position)?;
         if row.row_id == row_id {
             Some(position)
@@ -62,6 +64,26 @@ impl RowIndex {
 
     pub fn rows(&self) -> &[LogRow] {
         &self.rows
+    }
+
+    /// Drop the oldest `n` rows from the front of the store and return how
+    /// many were actually evicted (capped at the current row count). The
+    /// monotonic `RowId` counter is preserved so bookmarks and saved
+    /// references remain meaningful (they just no longer resolve to a row).
+    pub fn evict_oldest(&mut self, n: usize) -> usize {
+        let to_evict = n.min(self.rows.len());
+        if to_evict == 0 {
+            return 0;
+        }
+        self.rows.drain(0..to_evict);
+        self.evicted += to_evict as u64;
+        to_evict
+    }
+
+    /// Total number of rows evicted across the lifetime of this index.
+    /// UIs can surface this so users see history has been truncated.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted
     }
 }
 
@@ -117,5 +139,40 @@ mod tests {
         assert_eq!(index.position_of(a), Some(0));
         assert_eq!(index.position_of(b), Some(1));
         assert_eq!(index.position_of(RowId(999)), None);
+    }
+
+    #[test]
+    fn evict_oldest_drops_front_and_preserves_row_id_monotonicity() {
+        // Review perf P2: evicted rows return None from position_of but the
+        // monotonic RowId counter must not reset — subsequent appends get
+        // ids past the evicted range so bookmarks/saved RowIds stay unique.
+        let mut index = RowIndex::default();
+        let a = index.append(mk_row("a")); // RowId(0)
+        let b = index.append(mk_row("b")); // RowId(1)
+        let c = index.append(mk_row("c")); // RowId(2)
+        assert_eq!(index.evict_oldest(2), 2);
+        assert_eq!(index.evicted_count(), 2);
+
+        // Evicted ids no longer resolve.
+        assert!(index.position_of(a).is_none());
+        assert!(index.position_of(b).is_none());
+        // Surviving row now sits at Vec position 0.
+        assert_eq!(index.position_of(c), Some(0));
+
+        // Next append gets RowId(3), not RowId(1) — counter survives eviction.
+        let d = index.append(mk_row("d"));
+        assert_eq!(d, RowId(3));
+        assert_eq!(index.position_of(d), Some(1));
+    }
+
+    #[test]
+    fn evict_oldest_capped_at_current_row_count() {
+        let mut index = RowIndex::default();
+        index.append(mk_row("a"));
+        index.append(mk_row("b"));
+        // Asking to evict more than exists evicts only what's there.
+        assert_eq!(index.evict_oldest(99), 2);
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.evicted_count(), 2);
     }
 }

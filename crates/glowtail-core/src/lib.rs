@@ -25,6 +25,6 @@ pub mod prelude {
     };
     pub use crate::parser::{CompositeParser, JsonLineParser, LogParser, PlainTextParser};
     pub use crate::session::{InvestigationSession, SessionIoError};
-    pub use crate::source::FileTailer;
+    pub use crate::source::{DEFAULT_TAILER_CHANNEL_CAPACITY, FileTailer};
     pub use crate::viewport::Engine;
 }

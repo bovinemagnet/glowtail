@@ -230,7 +230,7 @@ fn level_name(level: LogLevel) -> &'static str {
 
 /// Case-insensitive ASCII substring search without allocating either side.
 /// `needle` is assumed to already be lowercased.
-fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+pub(crate) fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
@@ -647,7 +647,14 @@ fn level_compare(operator: Token, value: String) -> Result<FilterExpr, FilterErr
             .map(|level| FilterExpr::Not(Box::new(FilterExpr::LevelAtLeast(level))))
             .unwrap_or(FilterExpr::All)),
         Token::Lt => Ok(FilterExpr::Not(Box::new(FilterExpr::LevelAtLeast(level)))),
-        _ => unreachable!("not an operator"),
+        // Defence in depth: the caller is expected to pre-filter to operator
+        // tokens via `consume_operator`, but the `Token` enum has many
+        // non-operator variants (`Word`, `LParen`, …). A refactor that routes
+        // a non-operator into this function is one easy mistake away from a
+        // production panic; return a query error instead.
+        other => Err(FilterError::InvalidQuery(format!(
+            "operator {other:?} not valid for level comparison"
+        ))),
     }
 }
 
@@ -868,6 +875,15 @@ mod tests {
         // potentially-failing field_compare for non-level fields.
         let err = parse_filter_query("source in (1, foo)").unwrap_err();
         assert!(format!("{err}").contains("invalid source id"));
+    }
+
+    #[test]
+    fn level_compare_with_non_operator_token_returns_error() {
+        // Defence in depth for review H2: a refactor that routed a
+        // non-operator token into `level_compare` used to hit `unreachable!`
+        // and panic in production. The catch-all now returns a query error.
+        let err = level_compare(Token::Word("nope".into()), "info".into()).unwrap_err();
+        assert!(format!("{err}").contains("not valid for level comparison"));
     }
 
     #[test]
