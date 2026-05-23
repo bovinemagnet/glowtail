@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+pub use glowtail_ui_common::LevelArg;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -66,16 +67,6 @@ pub enum Command {
         #[arg(long)]
         max_rows: Option<usize>,
     },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum LevelArg {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
 }
 
 #[cfg(test)]

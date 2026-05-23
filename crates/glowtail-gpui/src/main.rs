@@ -1,7 +1,9 @@
 use anyhow::{Context as AnyhowContext, Result};
-use clap::{Parser, ValueEnum};
-use glowtail_core::filter::compose_query_filter;
+use clap::Parser;
 use glowtail_core::prelude::*;
+use glowtail_ui_common::{
+    LevelArg, LiveTail, apply_filters, load_session, parser_from_flags, save_session, start_tailers,
+};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
     ListAlignment, ListOffset, ListState, ParentElement, Pixels, Render, SharedString, Styled,
@@ -67,16 +69,6 @@ struct Args {
     /// of the buffer when the cap is exceeded. `0` means unbounded (default).
     #[arg(long)]
     max_rows: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum LevelArg {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
 }
 
 fn main() -> Result<()> {
@@ -171,32 +163,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn start_tailers(
-    runtime: &Runtime,
-    paths: &[PathBuf],
-    parser: Arc<dyn LogParser>,
-    from_start: bool,
-) -> LiveTail {
-    let (tx, rx) = mpsc::channel(DEFAULT_TAILER_CHANNEL_CAPACITY);
-    let mut tailers = Vec::new();
-    let _guard = runtime.enter();
-    for (index, path) in paths.iter().enumerate() {
-        tailers.push(FileTailer::start(
-            SourceId((index + 1) as u64),
-            path.clone(),
-            Arc::clone(&parser),
-            tx.clone(),
-            from_start,
-            true,
-        ));
-    }
-    drop(tx);
-    LiveTail {
-        receiver: rx,
-        tailers,
-    }
-}
-
 /// Treat `--max-rows 0` and an absent flag as "unbounded" so the CLI surface
 /// is forgiving — `0` reading as "no rows retained" is a usability trap.
 fn normalise_max_rows(value: Option<usize>) -> Option<usize> {
@@ -204,85 +170,6 @@ fn normalise_max_rows(value: Option<usize>) -> Option<usize> {
         Some(0) | None => None,
         other => other,
     }
-}
-
-fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
-    if json {
-        Arc::new(JsonLineParser)
-    } else if plain {
-        Arc::new(PlainTextParser)
-    } else {
-        Arc::new(CompositeParser::default())
-    }
-}
-
-fn apply_filters(
-    engine: &mut Engine,
-    filter_text: Option<String>,
-    level: Option<LevelArg>,
-    use_filter: Option<String>,
-    save_filter: Option<String>,
-) -> Result<()> {
-    let saved = use_filter
-        .map(|name| {
-            engine
-                .session()
-                .saved_filter(&name)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("saved filter not found: {name}"))
-        })
-        .transpose()?;
-    let level: Option<LogLevel> = level.map(Into::into);
-    let filter = compose_query_filter(saved.as_ref(), level, filter_text.as_deref())?;
-    engine.set_filter(filter)?;
-    if let Some(name) = save_filter {
-        engine.save_filter(name);
-    }
-    Ok(())
-}
-
-fn load_session(path: Option<&PathBuf>) -> Result<InvestigationSession> {
-    let Some(path) = path else {
-        return Ok(InvestigationSession::default());
-    };
-    if !path.exists() {
-        return Ok(InvestigationSession::default());
-    }
-    InvestigationSession::load_from_path(path)
-        .with_context(|| format!("failed to load session {}", path.display()))
-}
-
-fn save_session(path: Option<&PathBuf>, session: &InvestigationSession) -> Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create session directory {}", parent.display()))?;
-    }
-    session
-        .save_to_path(path)
-        .with_context(|| format!("failed to save session {}", path.display()))
-}
-
-impl From<LevelArg> for LogLevel {
-    fn from(value: LevelArg) -> Self {
-        match value {
-            LevelArg::Trace => LogLevel::Trace,
-            LevelArg::Debug => LogLevel::Debug,
-            LevelArg::Info => LogLevel::Info,
-            LevelArg::Warn => LogLevel::Warn,
-            LevelArg::Error => LogLevel::Error,
-            LevelArg::Fatal => LogLevel::Fatal,
-        }
-    }
-}
-
-struct LiveTail {
-    receiver: mpsc::Receiver<LogEvent>,
-    tailers: Vec<FileTailer>,
 }
 
 struct GlowtailGpui {

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use args::{Args, Command, LevelArg};
 use clap::Parser;
 use glowtail_core::prelude::*;
+use glowtail_ui_common::{apply_filters, load_session, parser_from_flags, save_session};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -61,13 +62,7 @@ async fn main() -> Result<()> {
                 load_initial_engine(paths.clone(), Arc::clone(&parser), investigation).await?
             };
             engine.set_max_rows(normalise_max_rows(max_rows));
-            apply_filters_and_save(
-                &mut engine,
-                &filter,
-                level,
-                use_filter.as_deref(),
-                save_filter,
-            )?;
+            apply_filters(&mut engine, filter, level, use_filter, save_filter)?;
 
             let engine = if follow {
                 let (tx, rx) = mpsc::channel(DEFAULT_TAILER_CHANNEL_CAPACITY);
@@ -95,19 +90,9 @@ async fn main() -> Result<()> {
                 glowtail_tui::run_tui(engine)?
             };
 
-            save_session(session.as_ref(), engine.into_session())?;
+            save_session(session.as_ref(), &engine.into_session())?;
             Ok(())
         }
-    }
-}
-
-fn parser_from_flags(json: bool, plain: bool) -> Arc<dyn LogParser> {
-    if json {
-        Arc::new(JsonLineParser)
-    } else if plain {
-        Arc::new(PlainTextParser)
-    } else {
-        Arc::new(CompositeParser::default())
     }
 }
 
@@ -178,11 +163,11 @@ async fn run_tail_follow(options: TailRun) -> Result<()> {
     let investigation = load_session(options.session.as_ref())?;
     let mut engine = Engine::with_session(investigation);
     engine.set_max_rows(options.max_rows);
-    let filter_expr = apply_filters_and_save(
+    let filter_expr = apply_filters(
         &mut engine,
-        &options.filter_text,
+        options.filter_text,
         options.level,
-        options.use_filter.as_deref(),
+        options.use_filter,
         options.save_filter,
     )?;
     let compiled_filter = glowtail_core::filter::CompiledFilter::compile(&filter_expr)?;
@@ -209,7 +194,7 @@ async fn run_tail_follow(options: TailRun) -> Result<()> {
         tailer.stop().await;
     }
 
-    save_session(options.session.as_ref(), engine.into_session())?;
+    save_session(options.session.as_ref(), &engine.into_session())?;
     Ok(())
 }
 
@@ -218,11 +203,11 @@ async fn run_tail_no_follow(options: TailRun) -> Result<()> {
     let mut engine =
         load_initial_engine(options.paths, Arc::clone(&options.parser), investigation).await?;
     engine.set_max_rows(options.max_rows);
-    let filter_expr = apply_filters_and_save(
+    let filter_expr = apply_filters(
         &mut engine,
-        &options.filter_text,
+        options.filter_text,
         options.level,
-        options.use_filter.as_deref(),
+        options.use_filter,
         options.save_filter,
     )?;
     let compiled_filter = glowtail_core::filter::CompiledFilter::compile(&filter_expr)?;
@@ -233,71 +218,6 @@ async fn run_tail_no_follow(options: TailRun) -> Result<()> {
         }
     }
 
-    save_session(options.session.as_ref(), engine.into_session())?;
+    save_session(options.session.as_ref(), &engine.into_session())?;
     Ok(())
-}
-
-fn apply_filters_and_save(
-    engine: &mut Engine,
-    filter_text: &Option<String>,
-    level: Option<LevelArg>,
-    use_filter: Option<&str>,
-    save_filter: Option<String>,
-) -> Result<FilterExpr> {
-    let saved = use_filter
-        .map(|name| {
-            engine
-                .session()
-                .saved_filter(name)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("saved filter not found: {name}"))
-        })
-        .transpose()?;
-    let level: Option<LogLevel> = level.map(Into::into);
-    let filter =
-        glowtail_core::filter::compose_query_filter(saved.as_ref(), level, filter_text.as_deref())?;
-    engine.set_filter(filter.clone())?;
-    if let Some(name) = save_filter {
-        engine.save_filter(name);
-    }
-    Ok(filter)
-}
-
-fn load_session(path: Option<&PathBuf>) -> Result<InvestigationSession> {
-    let Some(path) = path else {
-        return Ok(InvestigationSession::default());
-    };
-    if !path.exists() {
-        return Ok(InvestigationSession::default());
-    }
-    InvestigationSession::load_from_path(path)
-        .with_context(|| format!("failed to load session {}", path.display()))
-}
-
-fn save_session(path: Option<&PathBuf>, session: InvestigationSession) -> Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create session directory {}", parent.display()))?;
-    }
-    session
-        .save_to_path(path)
-        .with_context(|| format!("failed to save session {}", path.display()))
-}
-
-impl From<LevelArg> for LogLevel {
-    fn from(value: LevelArg) -> Self {
-        match value {
-            LevelArg::Trace => LogLevel::Trace,
-            LevelArg::Debug => LogLevel::Debug,
-            LevelArg::Info => LogLevel::Info,
-            LevelArg::Warn => LogLevel::Warn,
-            LevelArg::Error => LogLevel::Error,
-            LevelArg::Fatal => LogLevel::Fatal,
-        }
-    }
 }

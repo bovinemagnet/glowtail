@@ -2840,6 +2840,7 @@ dependencies = [
  "clap",
  "glowtail-core",
  "glowtail-tui",
+ "glowtail-ui-common",
  "tokio",
 ]
 
@@ -2863,6 +2864,7 @@ dependencies = [
  "anyhow",
  "clap",
  "glowtail-core",
+ "glowtail-ui-common",
  "gpui",
  "tokio",
 ]
@@ -2875,6 +2877,7 @@ dependencies = [
  "clap",
  "eframe",
  "glowtail-core",
+ "glowtail-ui-common",
  "tokio",
 ]
 
@@ -2886,6 +2889,16 @@ dependencies = [
  "crossterm",
  "glowtail-core",
  "ratatui",
+ "tokio",
+]
+
+[[package]]
+name = "glowtail-ui-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "glowtail-core",
  "tokio",
 ]
 

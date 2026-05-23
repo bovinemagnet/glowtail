@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/glowtail-core",
+  "crates/glowtail-ui-common",
   "crates/glowtail-cli",
   "crates/glowtail-tui",
   "crates/glowtail-gui",

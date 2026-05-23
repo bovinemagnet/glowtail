@@ -9,4 +9,5 @@ anyhow.workspace = true
 clap.workspace = true
 eframe.workspace = true
 glowtail-core = { path = "../glowtail-core" }
+glowtail-ui-common = { path = "../glowtail-ui-common" }
 tokio.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "glowtail-cli"
+name = "glowtail-ui-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,4 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 glowtail-core = { path = "../glowtail-core" }
-glowtail-tui = { path = "../glowtail-tui" }
-glowtail-ui-common = { path = "../glowtail-ui-common" }
 tokio.workspace = true
