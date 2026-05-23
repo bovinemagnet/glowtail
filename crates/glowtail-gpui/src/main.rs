@@ -37,9 +37,33 @@ actions!(
         ScrollLeft,
         ScrollRight,
         ScrollLineStart,
-        ToggleFollow
+        ToggleFollow,
+        FilterTrace,
+        FilterDebug,
+        FilterInfo,
+        FilterWarn,
+        FilterError,
+        FilterFatal,
+        FilterClear,
+        CycleSavedFilter
     ]
 );
+
+/// Compute the next index into the saved-filter cycle. `None` means "no
+/// saved filter applied"; pressing past the last filter wraps back to
+/// `None` so the user can iterate `None -> first -> ... -> last -> None`.
+/// Pulled out as a pure fn so the cycle can be unit-tested without a GPUI
+/// context.
+fn next_saved_filter_cycle(current: Option<usize>, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    match current {
+        None => Some(0),
+        Some(i) if i + 1 >= total => None,
+        Some(i) => Some(i + 1),
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "glowtail-gpui")]
@@ -91,7 +115,7 @@ fn main() -> Result<()> {
         &mut engine,
         args.filter.clone(),
         args.level,
-        args.use_filter,
+        args.use_filter.clone(),
         args.save_filter,
     )?;
 
@@ -115,7 +139,16 @@ fn main() -> Result<()> {
     } else {
         Some(load_errors.join("; "))
     };
-    let app = GlowtailGpui::new(engine, runtime, live_tail, args.session, initial_status);
+    let app = GlowtailGpui::new(
+        engine,
+        runtime,
+        live_tail,
+        args.session,
+        initial_status,
+        args.level,
+        args.use_filter,
+        args.filter,
+    );
 
     let launch_error: Arc<std::sync::Mutex<Option<anyhow::Error>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -132,6 +165,14 @@ fn main() -> Result<()> {
             KeyBinding::new("right", ScrollRight, None),
             KeyBinding::new("cmd-left", ScrollLineStart, None),
             KeyBinding::new("f", ToggleFollow, None),
+            KeyBinding::new("1", FilterTrace, None),
+            KeyBinding::new("2", FilterDebug, None),
+            KeyBinding::new("3", FilterInfo, None),
+            KeyBinding::new("4", FilterWarn, None),
+            KeyBinding::new("5", FilterError, None),
+            KeyBinding::new("6", FilterFatal, None),
+            KeyBinding::new("0", FilterClear, None),
+            KeyBinding::new("s", CycleSavedFilter, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         let result = cx.open_window(
@@ -195,15 +236,32 @@ struct GlowtailGpui {
     /// have somewhere to dispatch.
     focus_handle: Option<FocusHandle>,
     focused_once: bool,
+    /// Current `--level`-style filter; mutated by the digit-key actions
+    /// (`1`–`6` set, `0` clears). Re-applied via [`Self::recompute_filter`]
+    /// so it composes with the text filter and the saved-filter cycle.
+    current_level: Option<LevelArg>,
+    /// Name of the saved filter currently applied, or `None` if no saved
+    /// filter is active. Mutated by [`Self::on_cycle_saved_filter`].
+    current_use_filter: Option<String>,
+    /// Free-text filter substring (from `--filter` today; Part B will hook
+    /// in-window text input into this same field).
+    current_text: Option<String>,
+    /// Cycle cursor for `CycleSavedFilter` (`s`). `None` = no saved filter
+    /// applied; otherwise the 0-based index into `session.saved_filters`.
+    saved_filter_cycle_idx: Option<usize>,
 }
 
 impl GlowtailGpui {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         engine: Engine,
         runtime: Runtime,
         live_tail: Option<LiveTail>,
         session_path: Option<PathBuf>,
         status_message: Option<String>,
+        initial_level: Option<LevelArg>,
+        initial_use_filter: Option<String>,
+        initial_text: Option<String>,
     ) -> Self {
         let engine = Rc::new(RefCell::new(engine));
         let (metadata, item_count) = {
@@ -226,6 +284,10 @@ impl GlowtailGpui {
             focus_handle: None,
             focused_once: false,
             follow,
+            current_level: initial_level,
+            current_use_filter: initial_use_filter,
+            current_text: initial_text,
+            saved_filter_cycle_idx: None,
         }
     }
 
@@ -390,6 +452,91 @@ impl GlowtailGpui {
         self.horizontal_offset_px = 0.0;
         cx.notify();
     }
+
+    /// Recompose level + saved-filter + text into a single [`FilterExpr`]
+    /// and apply it. Errors set the status message instead of crashing —
+    /// the only realistic source is a missing saved filter name, which
+    /// shouldn't happen given the cycle only ever picks names we just
+    /// read from the session, but we surface it rather than panic.
+    fn recompute_filter(&mut self) {
+        let result = {
+            let mut engine = self.engine.borrow_mut();
+            apply_filters(
+                &mut engine,
+                self.current_text.clone(),
+                self.current_level,
+                self.current_use_filter.clone(),
+                None,
+            )
+        };
+        if let Err(err) = result {
+            self.status_message = Some(format!("filter error: {err}"));
+            return;
+        }
+        self.refresh_metadata();
+    }
+
+    fn set_level_filter(&mut self, level: Option<LevelArg>, cx: &mut Context<Self>) {
+        self.current_level = level;
+        self.status_message = Some(match level {
+            None => "level filter cleared".into(),
+            Some(level) => format!("level filter: {level:?}").to_lowercase(),
+        });
+        self.recompute_filter();
+        cx.notify();
+    }
+
+    fn on_filter_trace(&mut self, _: &FilterTrace, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(Some(LevelArg::Trace), cx);
+    }
+    fn on_filter_debug(&mut self, _: &FilterDebug, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(Some(LevelArg::Debug), cx);
+    }
+    fn on_filter_info(&mut self, _: &FilterInfo, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(Some(LevelArg::Info), cx);
+    }
+    fn on_filter_warn(&mut self, _: &FilterWarn, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(Some(LevelArg::Warn), cx);
+    }
+    fn on_filter_error(&mut self, _: &FilterError, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(Some(LevelArg::Error), cx);
+    }
+    fn on_filter_fatal(&mut self, _: &FilterFatal, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(Some(LevelArg::Fatal), cx);
+    }
+    fn on_filter_clear(&mut self, _: &FilterClear, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_level_filter(None, cx);
+    }
+
+    fn on_cycle_saved_filter(
+        &mut self,
+        _: &CycleSavedFilter,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let names: Vec<String> = self
+            .engine
+            .borrow()
+            .session()
+            .saved_filters
+            .iter()
+            .map(|filter| filter.name.to_string())
+            .collect();
+        if names.is_empty() {
+            self.status_message = Some("no saved filters in session".into());
+            cx.notify();
+            return;
+        }
+        let next = next_saved_filter_cycle(self.saved_filter_cycle_idx, names.len());
+        self.saved_filter_cycle_idx = next;
+        self.current_use_filter = next.map(|i| names[i].clone());
+        self.status_message = Some(match &self.current_use_filter {
+            None => "saved filter cleared".into(),
+            Some(name) => format!("saved filter: {name}"),
+        });
+        self.recompute_filter();
+        cx.notify();
+    }
 }
 
 impl Drop for GlowtailGpui {
@@ -440,6 +587,14 @@ impl Render for GlowtailGpui {
             .on_action(cx.listener(Self::on_scroll_right))
             .on_action(cx.listener(Self::on_scroll_line_start))
             .on_action(cx.listener(Self::on_toggle_follow))
+            .on_action(cx.listener(Self::on_filter_trace))
+            .on_action(cx.listener(Self::on_filter_debug))
+            .on_action(cx.listener(Self::on_filter_info))
+            .on_action(cx.listener(Self::on_filter_warn))
+            .on_action(cx.listener(Self::on_filter_error))
+            .on_action(cx.listener(Self::on_filter_fatal))
+            .on_action(cx.listener(Self::on_filter_clear))
+            .on_action(cx.listener(Self::on_cycle_saved_filter))
             .bg(rgb(0x101418))
             .text_color(rgb(0xd8dee9))
             .font_family("monospace")
@@ -451,6 +606,8 @@ impl Render for GlowtailGpui {
                 self.follow,
                 self.status_message.as_deref(),
                 self.engine.borrow().evicted_row_count(),
+                self.current_level,
+                self.current_use_filter.as_deref(),
             ))
             .child(
                 div()
@@ -475,6 +632,8 @@ fn top_bar(
     follow: bool,
     status_message: Option<&str>,
     evicted_count: u64,
+    current_level: Option<LevelArg>,
+    current_use_filter: Option<&str>,
 ) -> impl IntoElement {
     let mode = if live_tail_enabled { "live" } else { "static" };
     let follow_label = if !live_tail_enabled {
@@ -493,6 +652,11 @@ fn top_bar(
     } else {
         "loaded once"
     });
+    let level_label = match current_level {
+        None => "off".to_string(),
+        Some(level) => format!("{level:?}").to_lowercase(),
+    };
+    let saved_label = current_use_filter.unwrap_or("—").to_string();
 
     let mut bar = div()
         .h(px(52.))
@@ -518,7 +682,9 @@ fn top_bar(
             snapshot.level_counts.error + snapshot.level_counts.fatal,
         ))
         .child(metric_text("mode", mode))
-        .child(metric_text("follow", follow_label));
+        .child(metric_text("follow", follow_label))
+        .child(metric_string("level", level_label))
+        .child(metric_string("saved", saved_label));
 
     if evicted_count > 0 {
         bar = bar.child(
@@ -548,6 +714,15 @@ fn metric(label: &'static str, value: usize) -> impl IntoElement {
 }
 
 fn metric_text(label: &'static str, value: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .gap_1()
+        .text_sm()
+        .child(div().text_color(rgb(0x7f8b96)).child(label))
+        .child(div().text_color(rgb(0xe6edf3)).child(value))
+}
+
+fn metric_string(label: &'static str, value: String) -> impl IntoElement {
     div()
         .flex()
         .gap_1()
@@ -837,5 +1012,38 @@ fn span_color(kind: SpanKind) -> gpui::Rgba {
         SpanKind::JsonKey => rgb(0x7ee7e7),
         SpanKind::JsonValue => rgb(0xa5d6a7),
         _ => rgb(0xe6edf3),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_saved_filter_cycle;
+
+    #[test]
+    fn cycle_with_no_saved_filters_returns_none() {
+        assert_eq!(next_saved_filter_cycle(None, 0), None);
+        assert_eq!(next_saved_filter_cycle(Some(0), 0), None);
+    }
+
+    #[test]
+    fn cycle_from_none_jumps_to_first() {
+        assert_eq!(next_saved_filter_cycle(None, 3), Some(0));
+    }
+
+    #[test]
+    fn cycle_advances_within_range() {
+        assert_eq!(next_saved_filter_cycle(Some(0), 3), Some(1));
+        assert_eq!(next_saved_filter_cycle(Some(1), 3), Some(2));
+    }
+
+    #[test]
+    fn cycle_past_last_wraps_to_none() {
+        assert_eq!(next_saved_filter_cycle(Some(2), 3), None);
+    }
+
+    #[test]
+    fn cycle_with_single_saved_filter_toggles_none_and_zero() {
+        assert_eq!(next_saved_filter_cycle(None, 1), Some(0));
+        assert_eq!(next_saved_filter_cycle(Some(0), 1), None);
     }
 }
