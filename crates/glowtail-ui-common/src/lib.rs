@@ -153,3 +153,47 @@ pub fn start_tailers(
         tailers,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for review M3: empty / whitespace-only `--filter`
+    /// strings used to be forwarded to the engine, leaving it up to
+    /// `compose_query_filter` to decide whether `Some("")` produced an
+    /// always-match filter or an error. The fix lives one layer down in
+    /// `compose_query_filter` itself (which now trims and skips), but the
+    /// behavioural guarantee is what every front-end depends on — so the
+    /// test belongs at the `apply_filters` boundary.
+    #[test]
+    fn apply_filters_treats_whitespace_only_text_as_no_filter() {
+        let baseline = {
+            let mut engine = Engine::default();
+            apply_filters(&mut engine, None, None, None, None).unwrap()
+        };
+        assert_eq!(baseline, FilterExpr::All);
+
+        for text in ["", "   ", "\t\n  "] {
+            let mut engine = Engine::default();
+            let actual = apply_filters(&mut engine, Some(text.into()), None, None, None).unwrap();
+            assert_eq!(
+                actual, baseline,
+                "filter text {text:?} should be treated as no filter"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_filters_with_non_blank_text_returns_non_trivial_filter() {
+        let mut engine = Engine::default();
+        let filter = apply_filters(&mut engine, Some("timeout".into()), None, None, None).unwrap();
+        assert_ne!(filter, FilterExpr::All);
+    }
+
+    #[test]
+    fn apply_filters_with_level_only_returns_level_filter() {
+        let mut engine = Engine::default();
+        let filter = apply_filters(&mut engine, None, Some(LevelArg::Warn), None, None).unwrap();
+        assert_eq!(filter, FilterExpr::LevelAtLeast(LogLevel::Warn));
+    }
+}
