@@ -13,9 +13,13 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 
 /// Default capacity for the `mpsc::channel` between a `FileTailer` and a UI
-/// consumer. Picked to absorb a small burst of appended rows without blocking
-/// the tailer task; UIs that drain at a known cadence may need to raise this.
-pub const DEFAULT_TAILER_CHANNEL_CAPACITY: usize = 1024;
+/// consumer. Sized to absorb large bursts without backpressuring the tailer
+/// task: sustained throughput is bounded by `capacity ÷ ui_poll_interval`, so
+/// a small cap caused the tailer's `send().await` to block long before the
+/// engine (which can absorb ~3M rows/s) had any work to do. At 16k entries
+/// and a 16ms UI drain cadence the plumbing supports ~1M rows/s with ~3MB of
+/// peak channel memory.
+pub const DEFAULT_TAILER_CHANNEL_CAPACITY: usize = 16384;
 
 pub struct FileTailer {
     stop: Arc<AtomicBool>,

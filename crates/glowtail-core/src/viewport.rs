@@ -368,15 +368,19 @@ impl Engine {
             return;
         }
         let raw = self.index.rows();
-        let mut positions: Vec<usize> = raw
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| self.compiled_filter.matches(row))
-            .filter(|(_, row)| {
-                !self.collapse_stack_traces || !Self::is_stack_trace_continuation(row)
-            })
-            .map(|(position, _)| position)
-            .collect();
+        // Preallocate to the upper bound so a filter change mid-tail doesn't
+        // pay 2-3 `Vec` doublings as the scan walks the row store. Selective
+        // filters over-allocate, but every UI keeps the rows themselves
+        // resident anyway, so the relative cost is negligible compared to the
+        // allocator churn of the iterator-`collect()` path it replaces.
+        let mut positions: Vec<usize> = Vec::with_capacity(raw.len());
+        for (position, row) in raw.iter().enumerate() {
+            if self.compiled_filter.matches(row)
+                && (!self.collapse_stack_traces || !Self::is_stack_trace_continuation(row))
+            {
+                positions.push(position);
+            }
+        }
         positions.sort_by(|left, right| {
             raw[*left]
                 .timestamp
