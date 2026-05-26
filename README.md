@@ -70,7 +70,7 @@ cargo run -p glowtail-gpui -- samples/mixed.log --session .glowtail-gpui-session
 
 By default the GPUI app follows appended lines through the shared `glowtail-core` tailer. Use `--no-follow` for a static preload, or `--from-start` to have the live tailer replay existing file contents before following new lines. `--session`, `--use-filter`, and `--save-filter` work as they do in the terminal commands and the GUI.
 
-The GPUI prototype has no in-app search, command palette, or row-selection controls — for those, use the GUI (`glowtail-gui`). It does have keyboard-driven filtering:
+The GPUI prototype now has row selection, bookmarks, in-window search with n/N navigation, a Cmd/Ctrl+K command palette, and keyboard-driven filtering — feature parity with `glowtail-gui` for the core interactive surface.
 
 | Key | Action |
 |-----|--------|
@@ -84,6 +84,13 @@ The GPUI prototype has no in-app search, command palette, or row-selection contr
 | `↑` / `↓` / `PgUp` / `PgDn` / `Home` / `End` | Scroll vertically; `End` re-engages follow mode |
 | `←` / `→` / `Cmd+←` | Scroll horizontally / reset to the line start |
 | `f` | Toggle follow mode (auto-scroll to the bottom on appended rows) |
+| `j` / `k` | Move the row-selection cursor down / up (auto-scrolls to keep the cursor visible; disables follow) |
+| `Shift+j` / `Shift+k` | Move the selection cursor by a page |
+| `b` | Bookmark (or unbookmark) the selected row — persists via `--session` |
+| `?` | Focus the search input (`enter` applies, `escape` cancels — same modal model as `/` for filters) |
+| `n` / `Shift+n` | Jump to the next / previous search match (auto-scrolls and moves the selection cursor) |
+| `Cmd+Shift+f` / `Ctrl+Shift+f` | Clear the active search |
+| `Cmd+k` / `Ctrl+k` | Toggle the command palette (j/k or arrows to select, `enter` to run, `escape` to close) |
 
 The text input is intentionally minimal: append-only, no cursor positioning, no IME composition. Use `escape` to discard a partial edit.
 
