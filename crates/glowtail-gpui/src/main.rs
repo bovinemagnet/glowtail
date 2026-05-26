@@ -7,7 +7,7 @@ use glowtail_ui_common::{
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyBinding,
     ListAlignment, ListOffset, ListState, ParentElement, Pixels, Render, SharedString, Styled,
-    Window, WindowBounds, WindowOptions, actions, div, list, prelude::*, px, rgb, size,
+    Window, WindowBounds, WindowOptions, actions, div, list, prelude::*, px, rgb, rgba, size,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -52,11 +52,65 @@ actions!(
         FilterClear,
         CycleSavedFilter,
         FocusFilterInput,
-        BlurFilterInput,
-        SubmitFilterInput,
-        FilterInputBackspace
+        BlurInput,
+        SubmitInput,
+        InputBackspace,
+        SelectUp,
+        SelectDown,
+        SelectPageUp,
+        SelectPageDown,
+        ToggleBookmark,
+        FocusSearchInput,
+        NextSearchMatch,
+        PrevSearchMatch,
+        ClearSearch,
+        TogglePalette,
+        Quit
     ]
 );
+
+/// One row in the command palette. The fixed `Action` variants cover the
+/// common operations that mirror the egui GUI's palette; `ApplySavedFilter`
+/// is generated dynamically per saved filter loaded from the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaletteCommand {
+    ClearFilter,
+    ClearSearch,
+    NextSearch,
+    PrevSearch,
+    ToggleBookmark,
+    ToggleFollow,
+    ApplySavedFilter(String),
+    Quit,
+}
+
+impl PaletteCommand {
+    fn label(&self) -> String {
+        match self {
+            Self::ClearFilter => "Clear filter (text and level)".to_string(),
+            Self::ClearSearch => "Clear search".to_string(),
+            Self::NextSearch => "Next search match".to_string(),
+            Self::PrevSearch => "Previous search match".to_string(),
+            Self::ToggleBookmark => "Toggle bookmark on selected row".to_string(),
+            Self::ToggleFollow => "Toggle follow mode".to_string(),
+            Self::ApplySavedFilter(name) => format!("Apply saved filter: {name}"),
+            Self::Quit => "Quit".to_string(),
+        }
+    }
+}
+
+/// Which (if any) of the in-window text inputs currently captures
+/// keystrokes. The two inputs (filter, search) are mutually exclusive
+/// by design: pressing `/` or `?` switches focus, and `escape`/`enter`/
+/// `backspace` route to whichever is active. Modelling this as an enum
+/// keeps "exactly one input is focused at a time" a type-level
+/// invariant instead of an implicit pair-of-bools rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFocus {
+    None,
+    Filter,
+    Search,
+}
 
 /// Append-only single-line text buffer for the filter input. No cursor
 /// positioning, no selection — pressing a key appends, backspace removes
@@ -136,6 +190,27 @@ fn next_saved_filter_cycle(current: Option<usize>, total: usize) -> Option<usize
     }
 }
 
+/// Compute the next selected position after pressing `j`/`k` (or arrow
+/// navigation). `delta` is signed (positive = down, negative = up).
+/// `total` is the number of currently-visible filtered rows. Returns
+/// `None` when the filtered view is empty; otherwise clamps to
+/// `[0, total - 1]`. From `None`, a downward move selects the first row
+/// and an upward move selects the last (matches the TUI behaviour).
+/// Pulled out as a pure fn so the clamping rules can be unit-tested
+/// without spinning up a GPUI window.
+fn next_selected_position(current: Option<usize>, delta: isize, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let max = total as isize - 1;
+    let next = match current {
+        None if delta >= 0 => 0,
+        None => max,
+        Some(pos) => (pos as isize).saturating_add(delta).clamp(0, max),
+    };
+    Some(next as usize)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "glowtail-gpui")]
 #[command(about = "Native GPUI glowtail desktop UI")]
@@ -150,8 +225,16 @@ struct Args {
     filter: Option<String>,
     #[arg(long)]
     level: Option<LevelArg>,
+    /// Don't tail the file. The viewport opens at the top and stays there;
+    /// no live updates are streamed from disk.
     #[arg(long)]
     no_follow: bool,
+    /// Open with the viewport pinned to the tail (newest row visible) and
+    /// follow new rows as they arrive — like `tail -f`. This is the default;
+    /// the flag exists so it can be set explicitly in scripts or shell history.
+    /// Scrolling up detaches; press `f` or `End` to re-attach.
+    #[arg(long, short = 'f', conflicts_with = "no_follow")]
+    follow: bool,
     #[arg(long)]
     from_start: bool,
     #[arg(long)]
@@ -245,9 +328,31 @@ fn main() -> Result<()> {
             KeyBinding::new("0", FilterClear, None),
             KeyBinding::new("s", CycleSavedFilter, None),
             KeyBinding::new("/", FocusFilterInput, None),
-            KeyBinding::new("escape", BlurFilterInput, None),
-            KeyBinding::new("enter", SubmitFilterInput, None),
-            KeyBinding::new("backspace", FilterInputBackspace, None),
+            KeyBinding::new("escape", BlurInput, None),
+            KeyBinding::new("enter", SubmitInput, None),
+            KeyBinding::new("backspace", InputBackspace, None),
+            // Row selection cursor — independent of the scroll keys so
+            // arrows/PgUp/PgDn keep their existing "pan the viewport"
+            // behaviour while `j`/`k` move a separate selection marker.
+            KeyBinding::new("j", SelectDown, None),
+            KeyBinding::new("k", SelectUp, None),
+            KeyBinding::new("shift-j", SelectPageDown, None),
+            KeyBinding::new("shift-k", SelectPageUp, None),
+            KeyBinding::new("b", ToggleBookmark, None),
+            // Search: `?` opens the search input (pairs with `/` for
+            // filter); `n` / `shift-n` step through matches in the
+            // currently-filtered view. `cmd-shift-f` clears the search
+            // without having to re-focus and submit an empty value.
+            KeyBinding::new("?", FocusSearchInput, None),
+            KeyBinding::new("n", NextSearchMatch, None),
+            KeyBinding::new("shift-n", PrevSearchMatch, None),
+            KeyBinding::new("cmd-shift-f", ClearSearch, None),
+            KeyBinding::new("ctrl-shift-f", ClearSearch, None),
+            // Command palette: Cmd/Ctrl+K toggles the modal overlay.
+            // Inside the palette, j/k/PgUp/PgDn move the highlight,
+            // Enter executes, Escape closes.
+            KeyBinding::new("cmd-k", TogglePalette, None),
+            KeyBinding::new("ctrl-k", TogglePalette, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
         let result = cx.open_window(
@@ -306,6 +411,13 @@ struct GlowtailGpui {
     /// When true, every newly appended row scrolls the viewport to the bottom.
     /// Disabled by any upward navigation; re-enabled by `End` or the `f` toggle.
     follow: bool,
+    /// Set at construction when `follow` is true so that the very first
+    /// `render()` snaps the viewport to the bottom of the preloaded file.
+    /// Without this, `ListState::new(_, ListAlignment::Top, _)` lands the user
+    /// at row 0 and `refresh_metadata()` only re-scrolls on subsequent
+    /// appends — so users on stationary or slowly-growing files never saw
+    /// the tail. Cleared on the first frame that succeeds in scrolling.
+    pending_initial_scroll_to_bottom: bool,
     /// Populated in the `cx.new(...)` constructor closure once a `Context` is
     /// available. Used by `track_focus` on the root div so keyboard actions
     /// have somewhere to dispatch.
@@ -321,6 +433,11 @@ struct GlowtailGpui {
     /// Free-text filter substring (from `--filter` today; Part B will hook
     /// in-window text input into this same field).
     current_text: Option<String>,
+    /// Currently-applied search needle, mirrored from the engine's
+    /// internal state so we can restore the input buffer on blur. The
+    /// engine is the source of truth (`set_search_text` / `search_results`);
+    /// we just remember what was last submitted.
+    current_search: Option<String>,
     /// Cycle cursor for `CycleSavedFilter` (`s`). `None` = no saved filter
     /// applied; otherwise the 0-based index into `session.saved_filters`.
     saved_filter_cycle_idx: Option<usize>,
@@ -328,11 +445,32 @@ struct GlowtailGpui {
     /// Becomes `current_text` only on `Enter`; until then the engine sees
     /// the previously-submitted value.
     filter_input: TextInputState,
-    /// True while the filter input is accepting keystrokes — suppresses
-    /// the navigation keybindings (digits, `f`, `s`, arrow keys, etc.) so
-    /// pressing those keys types into the input instead of triggering an
-    /// action.
-    filter_focused: bool,
+    /// Buffered text for the search input. Becomes the engine's search
+    /// needle on `Enter`; until then the engine sees the previously
+    /// submitted search value (or `None`).
+    search_input: TextInputState,
+    /// Which (if any) input currently captures keystrokes. While any
+    /// input is focused, the navigation keybindings (digits, `f`, `s`,
+    /// arrow keys, j/k, b, n/N, …) are suppressed so keys type into the
+    /// input instead of triggering an action.
+    input_focus: InputFocus,
+    /// Currently-selected row, identified by `RowId` so the selection
+    /// survives filter changes that reorder/hide rows. The viewport
+    /// position is re-derived on each render via
+    /// [`Engine::filtered_position_for_row`]; if the row is filtered out
+    /// the cursor disappears but the row id is retained so the user can
+    /// restore the filter and recover the selection.
+    selected_row_id: Option<RowId>,
+    /// True while the command-palette modal is open. While open, the
+    /// `j`/`k`/arrow/page actions move the palette cursor, `Enter`
+    /// executes the highlighted command, and `Escape` closes the palette.
+    /// `any_input_focused()` treats this the same as a focused text
+    /// input, so the level/filter/scroll bindings stay suppressed.
+    palette_open: bool,
+    /// Index of the highlighted palette command. Clamped on each render
+    /// against the dynamically-sized command list so a session reload
+    /// with fewer saved filters doesn't leave the cursor dangling.
+    palette_cursor: usize,
 }
 
 impl GlowtailGpui {
@@ -368,12 +506,18 @@ impl GlowtailGpui {
             focus_handle: None,
             focused_once: false,
             follow,
+            pending_initial_scroll_to_bottom: follow,
             current_level: initial_level,
             current_use_filter: initial_use_filter,
             current_text: initial_text.clone(),
+            current_search: None,
             saved_filter_cycle_idx: None,
             filter_input: TextInputState::new(initial_text),
-            filter_focused: false,
+            search_input: TextInputState::new(None),
+            input_focus: InputFocus::None,
+            selected_row_id: None,
+            palette_open: false,
+            palette_cursor: 0,
         }
     }
 
@@ -484,7 +628,7 @@ impl GlowtailGpui {
     }
 
     fn on_scroll_up(&mut self, _: &ScrollUp, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.follow = false;
@@ -492,14 +636,14 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_scroll_down(&mut self, _: &ScrollDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.scroll_by_items(1);
         cx.notify();
     }
     fn on_page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.follow = false;
@@ -507,14 +651,14 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.scroll_by_items(PAGE_SIZE_HINT as isize);
         cx.notify();
     }
     fn on_scroll_home(&mut self, _: &ScrollHome, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.follow = false;
@@ -525,7 +669,7 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_scroll_end(&mut self, _: &ScrollEnd, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.follow = true;
@@ -533,7 +677,7 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_toggle_follow(&mut self, _: &ToggleFollow, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.follow = !self.follow;
@@ -543,14 +687,14 @@ impl GlowtailGpui {
         cx.notify();
     }
     fn on_scroll_left(&mut self, _: &ScrollLeft, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.horizontal_offset_px = (self.horizontal_offset_px - HORIZONTAL_STEP_PX).max(0.0);
         cx.notify();
     }
     fn on_scroll_right(&mut self, _: &ScrollRight, _: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.horizontal_offset_px += HORIZONTAL_STEP_PX;
@@ -562,7 +706,7 @@ impl GlowtailGpui {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.horizontal_offset_px = 0.0;
@@ -593,7 +737,7 @@ impl GlowtailGpui {
     }
 
     fn set_level_filter(&mut self, level: Option<LevelArg>, cx: &mut Context<Self>) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         self.current_level = level;
@@ -633,7 +777,7 @@ impl GlowtailGpui {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.filter_focused {
+        if self.any_input_focused() {
             return;
         }
         let names: Vec<String> = self
@@ -660,87 +804,404 @@ impl GlowtailGpui {
         cx.notify();
     }
 
+    fn any_input_focused(&self) -> bool {
+        self.input_focus != InputFocus::None || self.palette_open
+    }
+
+    /// Build the current palette command list. Order is stable so
+    /// keyboard muscle-memory holds across sessions; saved-filter
+    /// commands come last because their count varies per session.
+    fn palette_commands(&self) -> Vec<PaletteCommand> {
+        let mut commands = vec![
+            PaletteCommand::ClearFilter,
+            PaletteCommand::ClearSearch,
+            PaletteCommand::NextSearch,
+            PaletteCommand::PrevSearch,
+            PaletteCommand::ToggleBookmark,
+            PaletteCommand::ToggleFollow,
+        ];
+        for saved in &self.engine.borrow().session().saved_filters {
+            commands.push(PaletteCommand::ApplySavedFilter(saved.name.to_string()));
+        }
+        commands.push(PaletteCommand::Quit);
+        commands
+    }
+
+    fn execute_palette_command(&mut self, command: PaletteCommand, cx: &mut Context<Self>) {
+        match command {
+            PaletteCommand::ClearFilter => {
+                self.current_text = None;
+                self.current_level = None;
+                self.current_use_filter = None;
+                self.saved_filter_cycle_idx = None;
+                self.filter_input = TextInputState::new(None);
+                self.status_message = Some("filter cleared".into());
+                self.recompute_filter();
+            }
+            PaletteCommand::ClearSearch => {
+                self.current_search = None;
+                self.search_input = TextInputState::new(None);
+                self.engine.borrow_mut().set_search_text(None);
+                self.status_message = Some("search cleared".into());
+                self.refresh_metadata();
+            }
+            PaletteCommand::NextSearch => self.jump_to_match(false),
+            PaletteCommand::PrevSearch => self.jump_to_match(true),
+            PaletteCommand::ToggleBookmark => {
+                if let Some(row_id) = self.selected_row_id {
+                    let is_bookmarked = self.engine.borrow_mut().toggle_bookmark(row_id, None);
+                    self.status_message = Some(if is_bookmarked {
+                        format!("bookmarked row {}", row_id.0)
+                    } else {
+                        format!("removed bookmark on row {}", row_id.0)
+                    });
+                    self.save_session();
+                } else {
+                    self.status_message = Some("select a row first (press j/k)".into());
+                }
+            }
+            PaletteCommand::ToggleFollow => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.scroll_to_bottom();
+                }
+            }
+            PaletteCommand::ApplySavedFilter(name) => {
+                self.current_use_filter = Some(name.clone());
+                // Sync the cycle cursor so subsequent presses of `s`
+                // continue from the just-applied filter instead of
+                // restarting from the first saved entry.
+                self.saved_filter_cycle_idx = self
+                    .engine
+                    .borrow()
+                    .session()
+                    .saved_filters
+                    .iter()
+                    .position(|saved| saved.name.as_ref() == name);
+                self.status_message = Some(format!("saved filter: {name}"));
+                self.recompute_filter();
+            }
+            PaletteCommand::Quit => {
+                cx.quit();
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_toggle_palette(&mut self, _: &TogglePalette, _: &mut Window, cx: &mut Context<Self>) {
+        // Reject toggle while a text input owns focus — pressing cmd-k
+        // while typing should add a character to the input (handled by
+        // `on_key_down_capture`), not open the palette.
+        if self.input_focus != InputFocus::None {
+            return;
+        }
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.palette_cursor = 0;
+        }
+        cx.notify();
+    }
+
     fn on_focus_filter_input(
         &mut self,
         _: &FocusFilterInput,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.filter_focused {
-            self.filter_focused = true;
-            self.status_message = Some("filter: typing... (enter to apply, esc to cancel)".into());
+        if self.palette_open || self.input_focus == InputFocus::Filter {
+            return;
+        }
+        // Switching away from a half-typed search: reset the search buffer to
+        // the last submitted value so a future re-focus doesn't show stale
+        // keystrokes. Symmetric with `on_focus_search_input`.
+        if self.input_focus == InputFocus::Search {
+            self.search_input = TextInputState::new(self.current_search.clone());
+        }
+        self.input_focus = InputFocus::Filter;
+        self.status_message = Some("filter: typing... (enter to apply, esc to cancel)".into());
+        cx.notify();
+    }
+
+    fn on_focus_search_input(
+        &mut self,
+        _: &FocusSearchInput,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_open || self.input_focus == InputFocus::Search {
+            return;
+        }
+        if self.input_focus == InputFocus::Filter {
+            self.filter_input = TextInputState::new(self.current_text.clone());
+        }
+        self.input_focus = InputFocus::Search;
+        self.status_message = Some("search: typing... (enter to apply, esc to cancel)".into());
+        cx.notify();
+    }
+
+    fn on_blur_input(&mut self, _: &BlurInput, _: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.palette_open = false;
+            cx.notify();
+            return;
+        }
+        match self.input_focus {
+            InputFocus::None => {}
+            InputFocus::Filter => {
+                // Restore the input buffer to whatever was last submitted so a
+                // future refocus doesn't show abandoned keystrokes.
+                self.filter_input = TextInputState::new(self.current_text.clone());
+                self.input_focus = InputFocus::None;
+                self.status_message = Some("filter input cancelled".into());
+                cx.notify();
+            }
+            InputFocus::Search => {
+                self.search_input = TextInputState::new(self.current_search.clone());
+                self.input_focus = InputFocus::None;
+                self.status_message = Some("search input cancelled".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_submit_input(&mut self, _: &SubmitInput, _: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            let commands = self.palette_commands();
+            if let Some(command) = commands.get(self.palette_cursor).cloned() {
+                self.palette_open = false;
+                self.execute_palette_command(command, cx);
+            }
+            return;
+        }
+        match self.input_focus {
+            InputFocus::None => {}
+            InputFocus::Filter => {
+                let trimmed = self.filter_input.value().trim();
+                self.current_text = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                self.input_focus = InputFocus::None;
+                self.status_message = Some(match &self.current_text {
+                    None => "text filter cleared".into(),
+                    Some(text) => format!("text filter: {text}"),
+                });
+                self.recompute_filter();
+                cx.notify();
+            }
+            InputFocus::Search => {
+                let trimmed = self.search_input.value().trim();
+                self.current_search = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                self.input_focus = InputFocus::None;
+                self.engine
+                    .borrow_mut()
+                    .set_search_text(self.current_search.clone());
+                self.status_message = Some(match &self.current_search {
+                    None => "search cleared".into(),
+                    Some(text) => format!("search: {text} (n/N to navigate)"),
+                });
+                // Jump to the first match so the user sees the result of
+                // pressing Enter, mirroring the egui GUI's behaviour.
+                self.jump_to_match(false);
+                self.refresh_metadata();
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_input_backspace(&mut self, _: &InputBackspace, _: &mut Window, cx: &mut Context<Self>) {
+        match self.input_focus {
+            InputFocus::None => {}
+            InputFocus::Filter => {
+                self.filter_input.backspace();
+                cx.notify();
+            }
+            InputFocus::Search => {
+                self.search_input.backspace();
+                cx.notify();
+            }
+        }
+    }
+
+    fn jump_to_match(&mut self, reverse: bool) {
+        let current = self.selected_row_id;
+        let next = self
+            .engine
+            .borrow_mut()
+            .next_search_result(current, reverse);
+        let Some(row_id) = next else {
+            self.status_message = Some("no search matches".into());
+            return;
+        };
+        let position = self.engine.borrow_mut().filtered_position_for_row(row_id);
+        self.selected_row_id = Some(row_id);
+        if let Some(pos) = position {
+            self.list_state.scroll_to_reveal_item(pos);
+        }
+        self.follow = false;
+    }
+
+    fn on_next_search_match(
+        &mut self,
+        _: &NextSearchMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.any_input_focused() {
+            return;
+        }
+        self.jump_to_match(false);
+        cx.notify();
+    }
+
+    fn on_prev_search_match(
+        &mut self,
+        _: &PrevSearchMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.any_input_focused() {
+            return;
+        }
+        self.jump_to_match(true);
+        cx.notify();
+    }
+
+    fn on_clear_search(&mut self, _: &ClearSearch, _: &mut Window, cx: &mut Context<Self>) {
+        if self.any_input_focused() {
+            return;
+        }
+        self.current_search = None;
+        self.search_input = TextInputState::new(None);
+        self.engine.borrow_mut().set_search_text(None);
+        self.status_message = Some("search cleared".into());
+        self.refresh_metadata();
+        cx.notify();
+    }
+
+    /// Look up the visible position of [`Self::selected_row_id`] in the
+    /// current filtered view. Returns `None` if no row is selected or if
+    /// the selection has been filtered out — both are valid states and
+    /// the UI degrades gracefully (no highlight, bookmark action surfaces
+    /// a status message).
+    fn selected_position(&self) -> Option<usize> {
+        let row_id = self.selected_row_id?;
+        self.engine.borrow_mut().filtered_position_for_row(row_id)
+    }
+
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let total = self.list_state.item_count();
+        let current = self.selected_position();
+        let Some(next) = next_selected_position(current, delta, total) else {
+            self.selected_row_id = None;
+            cx.notify();
+            return;
+        };
+        // Map the new position back to a stable RowId so subsequent filter
+        // changes don't drop the cursor onto a different row.
+        let row_id = self
+            .engine
+            .borrow_mut()
+            .present_row_at(next)
+            .map(|row| row.row_id);
+        self.selected_row_id = row_id;
+        self.list_state.scroll_to_reveal_item(next);
+        // Manual selection moves disengage follow — same convention as
+        // the scroll keys: the user is now investigating, not tailing.
+        self.follow = false;
+        cx.notify();
+    }
+
+    fn move_palette_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let total = self.palette_commands().len();
+        if let Some(next) = next_selected_position(Some(self.palette_cursor), delta, total) {
+            self.palette_cursor = next;
             cx.notify();
         }
     }
 
-    fn on_blur_filter_input(
-        &mut self,
-        _: &BlurFilterInput,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.filter_focused {
+    fn on_select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.move_palette_cursor(-1, cx);
             return;
         }
-        self.filter_focused = false;
-        // Restore the input buffer to whatever was last submitted so a future
-        // refocus doesn't show abandoned keystrokes.
-        self.filter_input = TextInputState::new(self.current_text.clone());
-        self.status_message = Some("filter input cancelled".into());
-        cx.notify();
+        if self.any_input_focused() {
+            return;
+        }
+        self.move_selection(-1, cx);
+    }
+    fn on_select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.move_palette_cursor(1, cx);
+            return;
+        }
+        if self.any_input_focused() {
+            return;
+        }
+        self.move_selection(1, cx);
+    }
+    fn on_select_page_up(&mut self, _: &SelectPageUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.move_palette_cursor(-(PAGE_SIZE_HINT as isize), cx);
+            return;
+        }
+        if self.any_input_focused() {
+            return;
+        }
+        self.move_selection(-(PAGE_SIZE_HINT as isize), cx);
+    }
+    fn on_select_page_down(&mut self, _: &SelectPageDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.move_palette_cursor(PAGE_SIZE_HINT as isize, cx);
+            return;
+        }
+        if self.any_input_focused() {
+            return;
+        }
+        self.move_selection(PAGE_SIZE_HINT as isize, cx);
     }
 
-    fn on_submit_filter_input(
-        &mut self,
-        _: &SubmitFilterInput,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.filter_focused {
+    fn on_toggle_bookmark(&mut self, _: &ToggleBookmark, _: &mut Window, cx: &mut Context<Self>) {
+        if self.any_input_focused() {
             return;
         }
-        let trimmed = self.filter_input.value().trim();
-        self.current_text = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+        let Some(row_id) = self.selected_row_id else {
+            self.status_message = Some("select a row first (press j/k)".into());
+            cx.notify();
+            return;
         };
-        self.filter_focused = false;
-        self.status_message = Some(match &self.current_text {
-            None => "text filter cleared".into(),
-            Some(text) => format!("text filter: {text}"),
+        let is_bookmarked = self.engine.borrow_mut().toggle_bookmark(row_id, None);
+        self.status_message = Some(if is_bookmarked {
+            format!("bookmarked row {}", row_id.0)
+        } else {
+            format!("removed bookmark on row {}", row_id.0)
         });
-        self.recompute_filter();
+        self.save_session();
         cx.notify();
     }
 
-    fn on_filter_input_backspace(
-        &mut self,
-        _: &FilterInputBackspace,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.filter_focused {
-            return;
-        }
-        self.filter_input.backspace();
-        cx.notify();
-    }
-
-    /// Bubble-phase key handler that captures printable input into the filter
-    /// buffer when [`Self::filter_focused`] is true. Action bindings still
-    /// fire alongside this (GPUI dispatches both), but the navigation
-    /// handlers each guard on `filter_focused` so the net effect is "keys
-    /// type into the input, nothing else moves".
+    /// Bubble-phase key handler that captures printable input into the
+    /// currently-focused text input ([`InputFocus::Filter`] or
+    /// [`InputFocus::Search`]). Action bindings still fire alongside this
+    /// (GPUI dispatches both), but the navigation handlers each guard on
+    /// [`Self::any_input_focused`] so the net effect is "keys type into
+    /// the input, nothing else moves".
     fn on_key_down_capture(
         &mut self,
         event: &gpui::KeyDownEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.filter_focused {
-            return;
-        }
+        let target = match self.input_focus {
+            InputFocus::None => return,
+            InputFocus::Filter => &mut self.filter_input,
+            InputFocus::Search => &mut self.search_input,
+        };
         let ks = &event.keystroke;
         let m = &ks.modifiers;
         if let Some(c) = keystroke_to_input_char(
@@ -750,7 +1211,7 @@ impl GlowtailGpui {
             m.alt,
             m.function,
         ) {
-            self.filter_input.append_char(c);
+            target.append_char(c);
             cx.notify();
         }
     }
@@ -773,13 +1234,26 @@ impl Drop for GlowtailGpui {
 impl Render for GlowtailGpui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_live_events();
+        // Honour `--follow`/default-follow on first paint: snap to the bottom
+        // of whatever was preloaded so the user sees the tail instead of
+        // row 0. Stays armed across no-op frames (empty file) until there's
+        // something to scroll to.
+        if self.pending_initial_scroll_to_bottom && self.list_state.item_count() > 0 {
+            self.scroll_to_bottom();
+            self.pending_initial_scroll_to_bottom = false;
+        }
         let metadata = Arc::clone(&self.metadata);
         let engine = Rc::clone(&self.engine);
-        // Snapshot the detail row up front so `detail_panel` doesn't borrow
-        // the engine concurrently with the lazy list-row render closures
-        // below — overlapping `borrow_mut()` calls would panic with
-        // `RefCell already borrowed` (review M7).
-        let detail_row = engine.borrow_mut().present_row_at(0);
+        // Snapshot both the selected position and a row to drive the
+        // detail panel up front. The detail panel prefers the cursor row
+        // and falls back to the first visible row so the panel still
+        // shows something on first load before the user has pressed
+        // j/k. Pre-fetching here also avoids overlapping `borrow_mut()`
+        // calls with the lazy list-row render closures below — see M7.
+        let selected_position = self.selected_position();
+        let detail_position = selected_position.unwrap_or(0);
+        let detail_row = engine.borrow_mut().present_row_at(detail_position);
+        let bookmark_count = engine.borrow().session().bookmarks.len();
         let focus_handle = self
             .focus_handle
             .clone()
@@ -791,8 +1265,21 @@ impl Render for GlowtailGpui {
             self.focused_once = true;
         }
         let horizontal_offset = self.horizontal_offset_px;
+        let palette = if self.palette_open {
+            let commands = self.palette_commands();
+            // Defensive clamp: the saved-filter list can shrink between
+            // renders (e.g. a session reload), so re-anchor a stale
+            // cursor instead of trusting the field blindly.
+            if self.palette_cursor >= commands.len() {
+                self.palette_cursor = commands.len().saturating_sub(1);
+            }
+            Some(palette_overlay(commands, self.palette_cursor))
+        } else {
+            None
+        };
         div()
             .size_full()
+            .relative()
             .track_focus(&focus_handle)
             .on_action(cx.listener(Self::on_scroll_up))
             .on_action(cx.listener(Self::on_scroll_down))
@@ -813,9 +1300,19 @@ impl Render for GlowtailGpui {
             .on_action(cx.listener(Self::on_filter_clear))
             .on_action(cx.listener(Self::on_cycle_saved_filter))
             .on_action(cx.listener(Self::on_focus_filter_input))
-            .on_action(cx.listener(Self::on_blur_filter_input))
-            .on_action(cx.listener(Self::on_submit_filter_input))
-            .on_action(cx.listener(Self::on_filter_input_backspace))
+            .on_action(cx.listener(Self::on_focus_search_input))
+            .on_action(cx.listener(Self::on_blur_input))
+            .on_action(cx.listener(Self::on_submit_input))
+            .on_action(cx.listener(Self::on_input_backspace))
+            .on_action(cx.listener(Self::on_select_up))
+            .on_action(cx.listener(Self::on_select_down))
+            .on_action(cx.listener(Self::on_select_page_up))
+            .on_action(cx.listener(Self::on_select_page_down))
+            .on_action(cx.listener(Self::on_toggle_bookmark))
+            .on_action(cx.listener(Self::on_next_search_match))
+            .on_action(cx.listener(Self::on_prev_search_match))
+            .on_action(cx.listener(Self::on_clear_search))
+            .on_action(cx.listener(Self::on_toggle_palette))
             .on_key_down(cx.listener(Self::on_key_down_capture))
             .bg(rgb(0x101418))
             .text_color(rgb(0xd8dee9))
@@ -831,7 +1328,9 @@ impl Render for GlowtailGpui {
                 self.current_level,
                 self.current_use_filter.as_deref(),
                 self.filter_input.value(),
-                self.filter_focused,
+                self.search_input.value(),
+                self.input_focus,
+                bookmark_count,
             ))
             .child(
                 div()
@@ -843,10 +1342,12 @@ impl Render for GlowtailGpui {
                         engine,
                         self.list_state.clone(),
                         horizontal_offset,
+                        selected_position,
                     ))
                     .child(detail_panel(detail_row)),
             )
             .child(timeline_panel(&metadata))
+            .children(palette)
     }
 }
 
@@ -860,7 +1361,9 @@ fn top_bar(
     current_level: Option<LevelArg>,
     current_use_filter: Option<&str>,
     filter_input: &str,
-    filter_focused: bool,
+    search_input: &str,
+    input_focus: InputFocus,
+    bookmark_count: usize,
 ) -> impl IntoElement {
     let mode = if live_tail_enabled { "live" } else { "static" };
     let follow_label = if !live_tail_enabled {
@@ -912,7 +1415,17 @@ fn top_bar(
         .child(metric_text("follow", follow_label))
         .child(metric_string("level", level_label))
         .child(metric_string("saved", saved_label))
-        .child(filter_input_cell(filter_input, filter_focused));
+        .child(metric("bookmarks", bookmark_count))
+        .child(filter_input_cell(
+            "filter",
+            filter_input,
+            input_focus == InputFocus::Filter,
+        ))
+        .child(filter_input_cell(
+            "search",
+            search_input,
+            input_focus == InputFocus::Search,
+        ));
 
     if evicted_count > 0 {
         bar = bar.child(
@@ -959,11 +1472,12 @@ fn metric_string(label: &'static str, value: String) -> impl IntoElement {
         .child(div().text_color(rgb(0xe6edf3)).child(value))
 }
 
-/// Top-bar cell that doubles as the filter text input. When unfocused it
-/// shows the active text filter as plain text (or an em-dash placeholder).
-/// When focused it gains a coloured border and a trailing caret glyph so
-/// the user can see they're typing into something live.
-fn filter_input_cell(value: &str, focused: bool) -> impl IntoElement {
+/// Top-bar cell that doubles as a text input. When unfocused it shows
+/// the currently-applied value as plain text (or an em-dash placeholder).
+/// When focused it gains a coloured border and a trailing caret glyph
+/// so the user can see they're typing into something live. The `label`
+/// distinguishes the filter cell from the search cell at a glance.
+fn filter_input_cell(label: &'static str, value: &str, focused: bool) -> impl IntoElement {
     let display = if value.is_empty() && !focused {
         "—".to_string()
     } else if focused {
@@ -985,7 +1499,7 @@ fn filter_input_cell(value: &str, focused: bool) -> impl IntoElement {
         .px_2()
         .border_1()
         .border_color(border_color)
-        .child(div().text_color(rgb(0x7f8b96)).child("filter"))
+        .child(div().text_color(rgb(0x7f8b96)).child(label))
         .child(div().text_color(rgb(0xe6edf3)).child(display))
 }
 
@@ -1030,6 +1544,7 @@ fn log_viewport(
     engine: Rc<RefCell<Engine>>,
     list_state: ListState,
     horizontal_offset: f32,
+    selected_position: Option<usize>,
 ) -> impl IntoElement {
     div()
         .flex_1()
@@ -1052,7 +1567,8 @@ fn log_viewport(
         .child(
             list(list_state, move |index, _window, _cx| {
                 let row = engine.borrow_mut().present_row_at(index);
-                row_element(row, index, horizontal_offset)
+                let selected = selected_position == Some(index);
+                row_element(row, index, horizontal_offset, selected)
             })
             .flex_1(),
         )
@@ -1062,6 +1578,7 @@ fn row_element(
     row: Option<RowPresentation>,
     index: usize,
     horizontal_offset: f32,
+    selected: bool,
 ) -> gpui::AnyElement {
     let Some(row) = row else {
         return div().h(px(24.)).into_any();
@@ -1104,6 +1621,16 @@ fn row_element(
         content = content.child(span_div);
     }
 
+    // Selected row gets a brighter background and a cyan severity-strip
+    // overlay so the cursor is visible even on rows that already carry a
+    // severity colour (warn/error rows stay severity-tinted on the left).
+    let bg = if selected {
+        rgb(0x1f2a36)
+    } else if index.is_multiple_of(2) {
+        rgb(0x10161d)
+    } else {
+        rgb(0x0d1117)
+    };
     div()
         .h(px(24.))
         .w_full()
@@ -1112,13 +1639,13 @@ fn row_element(
         .gap_1()
         .px_2()
         .border_b_1()
-        .border_color(rgb(0x1c2530))
-        .overflow_hidden()
-        .bg(if index.is_multiple_of(2) {
-            rgb(0x10161d)
+        .border_color(if selected {
+            rgb(0x4f9ee3)
         } else {
-            rgb(0x0d1117)
+            rgb(0x1c2530)
         })
+        .overflow_hidden()
+        .bg(bg)
         .child(
             div()
                 .w(px(4.))
@@ -1128,6 +1655,68 @@ fn row_element(
         )
         .child(content)
         .into_any()
+}
+
+/// Modal command palette rendered as a centered overlay. Positioned
+/// absolutely (parent root is `.relative()`) so it covers the regular
+/// UI without reflowing it. Highlighted row matches the row-selection
+/// styling so the highlight contract is consistent across surfaces.
+fn palette_overlay(commands: Vec<PaletteCommand>, cursor: usize) -> impl IntoElement {
+    let mut list = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_2()
+        .w(px(520.))
+        .max_h(px(420.))
+        .overflow_hidden()
+        .rounded_md()
+        .bg(rgb(0x161c25))
+        .border_1()
+        .border_color(rgb(0x4f9ee3))
+        .child(
+            div()
+                .px_2()
+                .pb_2()
+                .text_sm()
+                .text_color(rgb(0x9aa7b2))
+                .child("Command palette · ↑↓/jk select · enter run · esc close"),
+        );
+    for (i, command) in commands.into_iter().enumerate() {
+        let selected = i == cursor;
+        let bg = if selected {
+            rgb(0x1f2a36)
+        } else {
+            rgb(0x10161d)
+        };
+        let border = if selected {
+            rgb(0x4f9ee3)
+        } else {
+            rgb(0x1c2530)
+        };
+        list = list.child(
+            div()
+                .px_3()
+                .py_1()
+                .text_sm()
+                .text_color(rgb(0xe6edf3))
+                .bg(bg)
+                .border_l_2()
+                .border_color(border)
+                .child(command.label()),
+        );
+    }
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000080))
+        .child(list)
 }
 
 fn detail_panel(selected: Option<RowPresentation>) -> impl IntoElement {
@@ -1275,7 +1864,10 @@ fn span_color(kind: SpanKind) -> gpui::Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextInputState, keystroke_to_input_char, next_saved_filter_cycle};
+    use super::{
+        PaletteCommand, TextInputState, keystroke_to_input_char, next_saved_filter_cycle,
+        next_selected_position,
+    };
 
     #[test]
     fn cycle_with_no_saved_filters_returns_none() {
@@ -1364,6 +1956,56 @@ mod tests {
             keystroke_to_input_char(Some("f"), false, false, true, false),
             None
         );
+    }
+
+    #[test]
+    fn selection_empty_view_stays_none() {
+        assert_eq!(next_selected_position(None, 1, 0), None);
+        assert_eq!(next_selected_position(Some(0), -1, 0), None);
+    }
+
+    #[test]
+    fn selection_from_none_picks_first_on_down_last_on_up() {
+        assert_eq!(next_selected_position(None, 1, 5), Some(0));
+        assert_eq!(next_selected_position(None, -1, 5), Some(4));
+        // `delta == 0` from `None` still anchors to the first row so the
+        // first-ever cursor placement is deterministic.
+        assert_eq!(next_selected_position(None, 0, 5), Some(0));
+    }
+
+    #[test]
+    fn selection_clamps_to_view_edges() {
+        assert_eq!(next_selected_position(Some(0), -1, 5), Some(0));
+        assert_eq!(next_selected_position(Some(4), 1, 5), Some(4));
+        // Large deltas (e.g. Page Down) saturate at the last row instead
+        // of wrapping or going off the end.
+        assert_eq!(next_selected_position(Some(2), 100, 5), Some(4));
+        assert_eq!(next_selected_position(Some(2), -100, 5), Some(0));
+    }
+
+    #[test]
+    fn selection_moves_within_range() {
+        assert_eq!(next_selected_position(Some(2), 1, 5), Some(3));
+        assert_eq!(next_selected_position(Some(2), -1, 5), Some(1));
+    }
+
+    #[test]
+    fn palette_command_label_includes_saved_filter_name() {
+        let cmd = PaletteCommand::ApplySavedFilter("warnings".to_string());
+        assert!(cmd.label().contains("warnings"));
+    }
+
+    #[test]
+    fn palette_command_labels_are_user_facing() {
+        // Smoke check on the static variants — these strings appear in the
+        // palette UI, so an accidental rename should fail a test, not
+        // ship to users.
+        assert_eq!(
+            PaletteCommand::ClearFilter.label(),
+            "Clear filter (text and level)"
+        );
+        assert_eq!(PaletteCommand::ClearSearch.label(), "Clear search");
+        assert_eq!(PaletteCommand::Quit.label(), "Quit");
     }
 
     #[test]
