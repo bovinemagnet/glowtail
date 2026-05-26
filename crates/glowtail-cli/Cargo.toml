@@ -11,3 +11,6 @@ glowtail-core = { path = "../glowtail-core" }
 glowtail-tui = { path = "../glowtail-tui" }
 glowtail-ui-common = { path = "../glowtail-ui-common" }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

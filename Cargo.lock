@@ -2841,6 +2841,7 @@ dependencies = [
  "glowtail-core",
  "glowtail-tui",
  "glowtail-ui-common",
+ "tempfile",
  "tokio",
 ]
 
