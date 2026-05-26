@@ -3,6 +3,43 @@
 :date: 2026-05-23
 :revision: 0.0.0
 
+== Status updates (2026-05-25)
+
+Findings closed since publish, in the order they were addressed. Each
+entry links to the file:line that confirms the fix. The original
+findings below are kept verbatim for historical context.
+
+[cols="1,2,3", options="header"]
+|===
+| Finding | Status | Evidence
+
+| M3
+| Resolved
+| `crates/glowtail-ui-common/src/lib.rs::apply_filters_treats_whitespace_only_text_as_no_filter` plus the shared `apply_filters` helper normalises empty/whitespace input to "no filter" before reaching the CLI or either GUI.
+
+| M5
+| Resolved
+| `FileTailer::signal_stop` (`crates/glowtail-core/src/source.rs:170`) is the non-async shutdown signal; both `GlowtailGui::drop` (`crates/glowtail-gui/src/main.rs`) and `GlowtailGpui::drop` (`crates/glowtail-gpui/src/main.rs`) now call it and let the runtime drop drive task completion. No more `block_on` from a Tokio worker.
+
+| M6
+| Resolved
+| Both GUIs accumulate per-path load errors and surface them as the initial status message instead of failing fast on the first unreadable path. See `crates/glowtail-gui/src/main.rs:57-130` and `crates/glowtail-gpui/src/main.rs:195-280`.
+
+| M7
+| Resolved (current code shape)
+| `render()` in `crates/glowtail-gpui/src/main.rs` now snapshots the detail-row presentation (and the selected-row position) up front before the lazy `list` closures run, so concurrent `borrow_mut()` calls during paint are no longer possible with the current child tree. The risk re-emerges only if a future change adds a new lazy borrow site — guard with a code comment if so.
+
+| M8
+| Resolved
+| `crates/glowtail-core/src/session.rs` caps `filter_history` at 100 (raised from 20), rotates via `VecDeque::pop_front` (O(1)), and is covered by `evicts_oldest_filter_history_past_cap`.
+
+| H1
+| Resolved
+| `crates/glowtail-core/src/viewport.rs` now caches search results alongside `filtered_positions` and invalidates both together — see `ensure_search_cache` (line 443) and the `search_cache_invalidates_on_row_append_and_filter_change` test (line 1090).
+|===
+
+Outstanding from the published review: **H2**, **M1**, **M2**, **M4**, **M9**, and the LOW-band findings (L1–L7) remain open. Tackle the LOWs as opportunistic cleanup; the surviving MEDIUMs are quality-of-life rather than correctness regressions.
+
 == Summary
 
 A full-coverage review of the `glowtail` workspace at HEAD `5d88a78` — ~5,800
