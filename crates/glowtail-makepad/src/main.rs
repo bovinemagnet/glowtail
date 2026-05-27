@@ -102,11 +102,16 @@ live_design! {
 
     pub LogList = <LogListBase> {
         width: Fill, height: Fill,
+        // Horizontal scrolling wraps the inner PortalList. Rows below
+        // use `width: Fit` so each row's natural width can exceed the
+        // viewport — the scroll bar lets the user scroll the band of
+        // rows left/right, mirroring the iced/gpui horizontal scroll.
+        scroll_bars: <ScrollBars> { show_scroll_x: true, show_scroll_y: false }
         list = <PortalList> {
             width: Fill, height: Fill,
             flow: Down,
             LogRow = <View> {
-                width: Fill, height: Fit,
+                width: Fit, height: Fit,
                 padding: { top: 2, bottom: 2, left: 6, right: 6 },
                 flow: Right,
                 source_tag = <Label> {

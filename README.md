@@ -126,7 +126,7 @@ A command palette, source sidebar, and horizontal scrolling are queued follow-up
 
 ## Makepad Desktop UI
 
-`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. A custom `LogList` widget wraps Makepad's virtualised `PortalList` and is fed the engine's `ViewportSnapshot` each time the live-tail channel produces new rows. A `NextFrame`-driven loop drains the channel without bringing tokio into Makepad's event loop, and the per-row text colour reflects severity via `apply_over` with a dynamic `Vec4`.
+`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. A custom `LogList` widget wraps Makepad's virtualised `PortalList` and is fed the engine's `ViewportSnapshot` each time the live-tail channel produces new rows. A `NextFrame`-driven loop drains the channel without bringing tokio into Makepad's event loop. Per-row colour is split across a static 16-slot `LogRow` template, one Label per `StyledSpan`, mirroring the per-span colouring that the egui/GPUI/Iced front-ends already do.
 
 ```bash
 cargo run -p glowtail-makepad -- samples/mixed.log
@@ -134,7 +134,9 @@ cargo run -p glowtail-makepad -- samples/mixed.log --filter timeout --level warn
 cargo run -p glowtail-makepad -- samples/mixed.log --session .glowtail-makepad-session.json
 ```
 
-The interactive surface (filter input, search nav, selection cursor, bookmarks, saved-filter cycling, level hotkeys, JSON detail panel) is layer 2 and tracked as an explicit follow-up. Per-span colouring inside a row is also deferred — the current `LogRow` template uses one Label tinted by severity rather than one Label per span.
+The interactive surface is at parity with `glowtail-iced` and `glowtail-gpui`: filter (`/`) and search (`?`) text inputs with an `InputMode` state machine, a row selection cursor (`j`/`k`/`↑`/`↓`), bookmark toggle (`b`), search-result navigation (`n`/`N`), saved-filter cycling (`s`), level hotkeys (`0`-`6`), follow toggle (`f`), stack-trace folding (`z`), a JSON detail panel for the selected row, a 220px source sidebar, and a `Cmd`/`Ctrl+K` command palette. Rows longer than the viewport scroll horizontally via the `<ScrollBars>`-wrapped `LogList`.
+
+Spans beyond the 16-slot cap in a single row fold into a `…` truncation marker — a deliberate trade-off against per-row dynamic widget creation. Realistic engine-produced row span counts top out around 10.
 
 ### Tailing a log file with glowtail-gpui
 
