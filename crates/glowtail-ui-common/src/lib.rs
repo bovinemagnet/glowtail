@@ -154,6 +154,58 @@ pub fn start_tailers(
     }
 }
 
+/// Build a synthetic viewport snapshot of `count` rows with realistic
+/// span distributions — a mix of plain-text rows (timestamp + level +
+/// message), JSON rows with a handful of fields, and `Warn`/`Error`
+/// rows that exercise the per-severity colour path. Used by each UI
+/// crate's `tests/render_perf.rs` to feed identical data into their
+/// per-span colour translation benches; lives here so the four bench
+/// files don't drift on data shape.
+pub fn sample_rows(count: u64) -> Vec<RowPresentation> {
+    use chrono::{DateTime, TimeZone, Utc};
+    use glowtail_core::model::ParsedFields;
+
+    let mut engine = Engine::default();
+    let base: DateTime<Utc> = Utc.with_ymd_and_hms(2026, 5, 27, 9, 0, 0).unwrap();
+    for id in 0..count {
+        let modulus = id % 6;
+        let level = match modulus {
+            0 => Some(LogLevel::Error),
+            1 => Some(LogLevel::Warn),
+            2..=4 => Some(LogLevel::Info),
+            _ => Some(LogLevel::Debug),
+        };
+        let mut fields = ParsedFields::default();
+        if modulus % 2 == 0 {
+            // Add JSON fields on every other row — exercises the
+            // JsonKey/JsonValue span paths.
+            fields.insert("service", "billing");
+            fields.insert("request_id", format!("req-{id}"));
+            fields.insert("duration_ms", format!("{}", id % 1000));
+        }
+        let message_text = format!("synthetic event #{id} timeout while contacting db");
+        let row = LogRow {
+            row_id: RowId(id),
+            source_id: SourceId((id % 3) + 1),
+            byte_range: ByteRange {
+                start: id * 120,
+                end: id * 120 + 119,
+            },
+            timestamp: Some(base + chrono::Duration::milliseconds(id as i64 * 50)),
+            level,
+            raw: Arc::from(message_text.clone()),
+            message: Arc::from(message_text),
+            fields,
+        };
+        engine.append_row(row);
+    }
+    let snapshot = engine.viewport(ViewportRequest {
+        first_row: 0,
+        row_count: count as usize,
+    });
+    snapshot.rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

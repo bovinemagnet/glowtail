@@ -288,6 +288,28 @@ For the optional large-viewport smoke benchmark:
 cargo test -p glowtail-core --test large_viewport -- --ignored
 ```
 
+### Per-UI translation seam benches
+
+Each desktop UI ships a `render_perf` test that times the per-frame CPU translation work (iterate viewport rows, compute `SeverityRole`, call `span_colour`/`span_color` per `StyledSpan`). Frame-rate and GPU costs need a real display and aren't measured here — these benches isolate the CPU portion of "what the UI does on top of the shared engine" so it's directly comparable between front-ends.
+
+```bash
+cargo test --release -p glowtail-gui     --test render_perf -- --ignored --nocapture
+cargo test --release -p glowtail-iced    --test render_perf -- --ignored --nocapture
+cargo test --release -p glowtail-gpui    --test render_perf -- --ignored --nocapture
+cargo test --release -p glowtail-makepad --test render_perf -- --ignored --nocapture
+```
+
+Indicative numbers from one run on a Linux laptop (10 000 rows × 50 iterations ≈ 5.75 M span lookups, release profile):
+
+| Front-end | ns/span | Notes |
+|---|---|---|
+| `glowtail-gui` (egui `Color32`) | ~4.7 | Packed 4-byte colour |
+| `glowtail-iced` (`iced::Color`) | ~4.7 | f32 RGBA |
+| `glowtail-makepad` (`Vec4`) | ~4.5 | f32 RGBA |
+| `glowtail-gpui` (`gpui::Rgba` via `rgb()` hex) | ~11.2 | Extra hex→RGB extraction per lookup |
+
+The takeaway: the four front-ends do roughly the same per-span CPU work modulo the colour-constructor cost. The dominant frame cost lives in the framework's draw and layout passes, which only a real display can measure.
+
 To exercise the engine against a larger synthetic log, generate one with the helper script and point any front-end at it:
 
 ```bash

@@ -21,3 +21,9 @@ run-iced:
 
 run-makepad:
 	cargo run -p glowtail-makepad -- samples/mixed.log
+
+bench-ui:
+	cargo test --release -p glowtail-gui     --test render_perf -- --ignored --nocapture
+	cargo test --release -p glowtail-iced    --test render_perf -- --ignored --nocapture
+	cargo test --release -p glowtail-gpui    --test render_perf -- --ignored --nocapture
+	cargo test --release -p glowtail-makepad --test render_perf -- --ignored --nocapture
