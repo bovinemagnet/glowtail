@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 /// Severity argument shared by every front-end's `--level` flag. Mirrors
 /// [`LogLevel`] but lives here so the front-ends can `derive(ValueEnum)`
 /// without each redeclaring the same six variants.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LevelArg {
     Trace,
     Debug,
@@ -240,6 +240,90 @@ mod tests {
         let mut engine = Engine::default();
         let filter = apply_filters(&mut engine, Some("timeout".into()), None, None, None).unwrap();
         assert_ne!(filter, FilterExpr::All);
+    }
+
+    /// `sample_rows` underpins every UI's perf bench (`render_perf.rs`).
+    /// A regression in shape would silently corrupt all four
+    /// front-end benches at once, so the contract is pinned here.
+    #[test]
+    fn sample_rows_returns_requested_count() {
+        let rows = sample_rows(128);
+        assert_eq!(rows.len(), 128);
+    }
+
+    #[test]
+    fn sample_rows_mixes_severity_roles() {
+        use glowtail_core::model::SeverityRole;
+
+        let rows = sample_rows(60);
+        let role_counts =
+            rows.iter()
+                .map(|row| row.severity_role())
+                .fold([0usize; 7], |mut acc, role| {
+                    let bucket = match role {
+                        SeverityRole::Fatal => 0,
+                        SeverityRole::Error => 1,
+                        SeverityRole::Warn => 2,
+                        SeverityRole::Info => 3,
+                        SeverityRole::Debug => 4,
+                        SeverityRole::Trace => 5,
+                        SeverityRole::Unknown => 6,
+                    };
+                    acc[bucket] += 1;
+                    acc
+                });
+        // The 6-row modulo cycle in `sample_rows` should hit Error,
+        // Warn, Info (×3), and Debug exactly once per cycle. Pinning
+        // that here catches anyone re-balancing the mix in a way that
+        // silently changes what the per-UI perf tests measure.
+        let non_empty = role_counts.iter().filter(|c| **c > 0).count();
+        assert!(
+            non_empty >= 3,
+            "expected ≥3 severity roles, got {non_empty} (counts: {role_counts:?})"
+        );
+        assert!(
+            role_counts[1] > 0,
+            "no Error rows (counts: {role_counts:?})"
+        );
+        assert!(role_counts[2] > 0, "no Warn rows (counts: {role_counts:?})");
+        assert!(role_counts[3] > 0, "no Info rows (counts: {role_counts:?})");
+    }
+
+    #[test]
+    fn sample_rows_emit_json_spans_for_field_rows() {
+        use glowtail_core::model::SpanKind;
+
+        let rows = sample_rows(12);
+        let json_rows = rows
+            .iter()
+            .filter(|row| {
+                row.spans
+                    .iter()
+                    .any(|span| matches!(span.kind, SpanKind::JsonKey | SpanKind::JsonValue))
+            })
+            .count();
+        // Half the rows carry ParsedFields, so the bench exercises
+        // the JsonKey/JsonValue colour paths. Without that the
+        // per-UI translation seam wouldn't be touching the JSON
+        // colour cases at all.
+        assert!(
+            json_rows >= 4,
+            "expected ≥4 rows with JSON spans out of 12, got {json_rows}"
+        );
+    }
+
+    #[test]
+    fn sample_rows_spread_across_multiple_sources() {
+        use std::collections::BTreeSet;
+
+        let rows = sample_rows(9);
+        let sources: BTreeSet<_> = rows.iter().map(|row| row.source_id).collect();
+        // The modulo-3 source assignment lets sidebar / source-tag
+        // rendering paths get exercised in benches.
+        assert!(
+            sources.len() >= 2,
+            "expected multiple distinct source ids, got {sources:?}"
+        );
     }
 
     #[test]

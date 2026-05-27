@@ -288,6 +288,24 @@ For the optional large-viewport smoke benchmark:
 cargo test -p glowtail-core --test large_viewport -- --ignored
 ```
 
+### Engine viewport sweep
+
+`viewport_perf.rs` measures `Engine::viewport()` across a sweep of viewport sizes (80 / 1 024 / 10 000 / 100 000 rows) and three filter intensities (no filter, `level >= warn`, `message contains "timeout"`). Every UI front-end pays this cost on every render that follows a state change, so the numbers show the shared per-frame floor independent of any framework:
+
+```bash
+cargo test --release -p glowtail-core --test viewport_perf -- --ignored --nocapture
+```
+
+Indicative numbers on the same Linux laptop, 100 000-row index:
+
+| Scenario | size 80 | size 1 024 | size 10 000 |
+|---|---|---|---|
+| no filter | ~1.4 ms | ~1.6 ms | ~4.3 ms |
+| `level >= warn` | ~230 µs | ~420 µs | ~2.6 ms |
+| `contains "timeout"` (warm) | ~1.4 ms | ~1.6 ms | ~3.6 ms |
+
+A no-filter "small viewport" call still costs ~1.4 ms because `ViewportSnapshot` carries metadata aggregates (`level_counts`, `source_summaries`, `timeline`) computed over the full filtered set, not just the requested window — the per-frame floor every UI inherits.
+
 ### Per-UI translation seam benches
 
 Each desktop UI ships a `render_perf` test that times the per-frame CPU translation work (iterate viewport rows, compute `SeverityRole`, call `span_colour`/`span_color` per `StyledSpan`). Frame-rate and GPU costs need a real display and aren't measured here — these benches isolate the CPU portion of "what the UI does on top of the shared engine" so it's directly comparable between front-ends.

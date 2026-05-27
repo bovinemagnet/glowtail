@@ -1205,3 +1205,86 @@ fn cycle_level(current: Option<LevelArg>) -> Option<LevelArg> {
         Some(LevelArg::Fatal) => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalise_max_rows_treats_zero_as_unbounded() {
+        // `--max-rows 0` would otherwise leave the engine retaining
+        // zero rows. The CLI surface deliberately reads `0` as "no
+        // cap" so users don't accidentally hide every row they tail.
+        assert_eq!(normalise_max_rows(Some(0)), None);
+        assert_eq!(normalise_max_rows(None), None);
+        assert_eq!(normalise_max_rows(Some(1)), Some(1));
+        assert_eq!(normalise_max_rows(Some(50_000)), Some(50_000));
+    }
+
+    #[test]
+    fn cycle_level_walks_full_loop() {
+        // The `level` button cycles through every variant of LevelArg
+        // and back through `None`. Without `None` in the cycle the
+        // user can't clear the filter from the button alone.
+        let mut state: Option<LevelArg> = None;
+        let expected = [
+            Some(LevelArg::Trace),
+            Some(LevelArg::Debug),
+            Some(LevelArg::Info),
+            Some(LevelArg::Warn),
+            Some(LevelArg::Error),
+            Some(LevelArg::Fatal),
+            None,
+        ];
+        for want in expected {
+            state = cycle_level(state);
+            assert_eq!(state, want, "cycle from previous returned wrong variant");
+        }
+        // Confirm a second loop reproduces the first.
+        for want in expected {
+            state = cycle_level(state);
+            assert_eq!(state, want);
+        }
+    }
+
+    #[test]
+    fn level_label_strings_match_button_chrome() {
+        // Status bar formatting / button labels both read this — drift
+        // here silently changes user-visible text.
+        assert_eq!(level_label(None), "all");
+        assert_eq!(level_label(Some(LevelArg::Trace)), "trace");
+        assert_eq!(level_label(Some(LevelArg::Debug)), "debug");
+        assert_eq!(level_label(Some(LevelArg::Info)), "info");
+        assert_eq!(level_label(Some(LevelArg::Warn)), "warn");
+        assert_eq!(level_label(Some(LevelArg::Error)), "error");
+        assert_eq!(level_label(Some(LevelArg::Fatal)), "fatal");
+    }
+
+    #[test]
+    fn severity_glyph_collapses_debug_and_trace() {
+        // We deliberately use the same `·` for trace/debug/info so the
+        // viewport doesn't look like a noisy column of bullet points
+        // at high severity. The test pins that intent so a future
+        // tweak that splits them is at least visible in the diff.
+        assert_eq!(severity_glyph(SeverityRole::Info), "·");
+        assert_eq!(severity_glyph(SeverityRole::Debug), "·");
+        assert_eq!(severity_glyph(SeverityRole::Trace), "·");
+        assert_eq!(severity_glyph(SeverityRole::Warn), "▲");
+        assert_eq!(severity_glyph(SeverityRole::Error), "■");
+        assert_eq!(severity_glyph(SeverityRole::Fatal), "■");
+        assert_eq!(severity_glyph(SeverityRole::Unknown), " ");
+    }
+
+    #[test]
+    fn span_colour_level_kind_follows_severity() {
+        // `SpanKind::Level` reuses the severity colour so the level
+        // word in a row matches the severity gutter. Catching this
+        // regression matters: a row labelled `WARN` painted with the
+        // default Message grey would mask severity in the UI.
+        let warn = span_colour(SpanKind::Level, SeverityRole::Warn);
+        let error = span_colour(SpanKind::Level, SeverityRole::Error);
+        assert_ne!(warn, error, "level colours must vary with severity");
+        assert_eq!(warn, severity_colour(SeverityRole::Warn));
+        assert_eq!(error, severity_colour(SeverityRole::Error));
+    }
+}

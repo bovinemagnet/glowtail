@@ -1425,3 +1425,82 @@ fn span_slot_id(index: usize) -> &'static [LiveId] {
         _ => id!(span_15),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalise_max_rows_treats_zero_as_unbounded() {
+        // `--max-rows 0` reads as "no cap" so users don't accidentally
+        // hide every row they tail when seeding the flag from a script.
+        assert_eq!(normalise_max_rows(Some(0)), None);
+        assert_eq!(normalise_max_rows(None), None);
+        assert_eq!(normalise_max_rows(Some(1)), Some(1));
+        assert_eq!(normalise_max_rows(Some(50_000)), Some(50_000));
+    }
+
+    #[test]
+    fn level_label_strings_match_status_chrome() {
+        // The status_label format string consumes these; drift here
+        // silently changes the user-visible status bar.
+        assert_eq!(level_label(None), "all");
+        assert_eq!(level_label(Some(LevelArg::Trace)), "trace");
+        assert_eq!(level_label(Some(LevelArg::Debug)), "debug");
+        assert_eq!(level_label(Some(LevelArg::Info)), "info");
+        assert_eq!(level_label(Some(LevelArg::Warn)), "warn");
+        assert_eq!(level_label(Some(LevelArg::Error)), "error");
+        assert_eq!(level_label(Some(LevelArg::Fatal)), "fatal");
+    }
+
+    #[test]
+    fn span_slot_id_maps_indices_to_distinct_slots() {
+        // Each index 0..SPAN_SLOT_COUNT must hit a unique Label slot
+        // — colliding slots would have spans overwriting each other
+        // inside a row.
+        let ids: Vec<&'static [LiveId]> = (0..SPAN_SLOT_COUNT).map(span_slot_id).collect();
+        for (i, &first) in ids.iter().enumerate() {
+            for (j, &second) in ids.iter().enumerate() {
+                if i != j {
+                    assert_ne!(first, second, "slots {i} and {j} resolved to the same id");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn span_slot_id_saturates_past_cap() {
+        // Spans beyond the slot count fold into the last slot — the
+        // populate loop in draw_walk also overwrites that slot with a
+        // `…` truncation marker, so the saturation arm must reliably
+        // return slot 15.
+        let last = span_slot_id(SPAN_SLOT_COUNT - 1);
+        assert_eq!(span_slot_id(SPAN_SLOT_COUNT), last);
+        assert_eq!(span_slot_id(SPAN_SLOT_COUNT + 5), last);
+        assert_eq!(span_slot_id(1024), last);
+        assert_eq!(span_slot_id(usize::MAX), last);
+    }
+
+    #[test]
+    fn span_colour_level_kind_follows_severity() {
+        // SpanKind::Level reuses the severity vec so the level word
+        // in a row paints the same hue as the severity gutter.
+        let warn = span_colour(SpanKind::Level, SeverityRole::Warn);
+        let error = span_colour(SpanKind::Level, SeverityRole::Error);
+        assert_ne!(warn, error, "level colours must vary with severity");
+        assert_eq!(warn, severity_vec(SeverityRole::Warn));
+        assert_eq!(error, severity_vec(SeverityRole::Error));
+    }
+
+    #[test]
+    fn rgb_to_vec4_is_alpha_one() {
+        // Every UI colour in this front-end is opaque — `w` is the
+        // alpha channel in Makepad's Vec4 shader inputs. A buggy
+        // helper that produced w != 1.0 would silently fade rows.
+        let v = rgb_to_vec4(0x12, 0x34, 0x56);
+        assert!((v.w - 1.0).abs() < f32::EPSILON);
+        assert!((v.x - 0x12 as f32 / 255.0).abs() < f32::EPSILON);
+        assert!((v.y - 0x34 as f32 / 255.0).abs() < f32::EPSILON);
+        assert!((v.z - 0x56 as f32 / 255.0).abs() < f32::EPSILON);
+    }
+}
