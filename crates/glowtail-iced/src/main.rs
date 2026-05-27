@@ -93,11 +93,36 @@ fn main() -> Result<()> {
 /// keyboard subscription always emits them, but the update handler gates
 /// them by mode so typing into a focused filter/search input doesn't
 /// accidentally toggle bookmarks.
+///
+/// `Palette` is a fourth mode that takes over the whole window so the
+/// user can browse and execute named actions via the command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Normal,
     Filter,
     Search,
+    Palette,
+}
+
+/// A single command palette entry — what's shown in the list and what
+/// happens when Enter fires. Saved-filter entries carry the filter
+/// name in `kind` so the dispatcher can call the engine directly.
+#[derive(Debug, Clone)]
+struct PaletteItem {
+    label: String,
+    kind: PaletteKind,
+}
+
+#[derive(Debug, Clone)]
+enum PaletteKind {
+    ToggleFollow,
+    ToggleStackFolding,
+    ClearLevel,
+    SetLevel(LevelArg),
+    CycleSavedFilter,
+    ApplySavedFilter(String),
+    ClearFilter,
+    ClearSearch,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +160,11 @@ enum Message {
     PageDown,
     HomePressed,
     EndPressed,
+    /// `Cmd+K` / `Ctrl+K` — toggle the command palette overlay.
+    PaletteToggled,
+    PaletteInputChanged(String),
+    /// Enter from within the palette — execute the highlighted item.
+    PaletteSubmitted,
     Tick,
 }
 
@@ -166,8 +196,15 @@ struct GlowtailIced {
     /// `z` toggle — when `true` the engine collapses stack-trace
     /// continuation lines into the header row's folded badge.
     fold_stacks: bool,
+    /// User-typed substring used to filter command palette items.
+    palette_query: String,
+    /// Position within the filtered palette list. Bounded by the call
+    /// site to the visible item count, so an empty filter keeps the
+    /// cursor at zero.
+    palette_selected: usize,
     filter_input_id: text_input::Id,
     search_input_id: text_input::Id,
+    palette_input_id: text_input::Id,
     session_path: Option<PathBuf>,
     /// Kept alive to host the `FileTailer` tasks. Dropped *after*
     /// `live_tail` so the runtime drives the tasks to completion when the
@@ -250,8 +287,11 @@ impl GlowtailIced {
             saved_filter_index: None,
             mode: InputMode::Normal,
             fold_stacks: false,
+            palette_query: String::new(),
+            palette_selected: 0,
             filter_input_id: text_input::Id::unique(),
             search_input_id: text_input::Id::unique(),
+            palette_input_id: text_input::Id::unique(),
             session_path: args.session,
             runtime,
             live_tail,
@@ -387,7 +427,33 @@ impl GlowtailIced {
                 text_input::focus(self.search_input_id.clone())
             }
             Message::EscapePressed => {
+                if self.mode == InputMode::Palette {
+                    self.palette_query.clear();
+                    self.palette_selected = 0;
+                }
                 self.mode = InputMode::Normal;
+                Task::none()
+            }
+            Message::PaletteToggled => {
+                if self.mode == InputMode::Palette {
+                    self.mode = InputMode::Normal;
+                    self.palette_query.clear();
+                    self.palette_selected = 0;
+                    Task::none()
+                } else {
+                    self.mode = InputMode::Palette;
+                    self.palette_query.clear();
+                    self.palette_selected = 0;
+                    text_input::focus(self.palette_input_id.clone())
+                }
+            }
+            Message::PaletteInputChanged(value) => {
+                self.palette_query = value;
+                self.palette_selected = 0;
+                Task::none()
+            }
+            Message::PaletteSubmitted if self.mode == InputMode::Palette => {
+                self.run_palette_item();
                 Task::none()
             }
             Message::LevelCycled => {
@@ -432,6 +498,18 @@ impl GlowtailIced {
             }
             Message::SelectionMoveUp if self.mode == InputMode::Normal => self.move_selection(-1),
             Message::SelectionMoveDown if self.mode == InputMode::Normal => self.move_selection(1),
+            // Reuse the arrow keys for palette navigation when the
+            // palette is open. Saves wiring two extra keyboard
+            // subscriptions and matches the GPUI palette UX.
+            Message::SelectionMoveUp if self.mode == InputMode::Palette => {
+                self.palette_selected = self.palette_selected.saturating_sub(1);
+                Task::none()
+            }
+            Message::SelectionMoveDown if self.mode == InputMode::Palette => {
+                let max = self.palette_items().len().saturating_sub(1);
+                self.palette_selected = (self.palette_selected + 1).min(max);
+                Task::none()
+            }
             Message::StackFoldingToggled if self.mode == InputMode::Normal => {
                 self.fold_stacks = !self.fold_stacks;
                 self.engine.set_stack_trace_folding(self.fold_stacks);
@@ -503,6 +581,135 @@ impl GlowtailIced {
         self.refresh_snapshot();
     }
 
+    /// Build the live list of command palette items based on the
+    /// current engine state. Cheap to call per-render because the work
+    /// is bounded by a small number of static actions plus one entry
+    /// per saved filter. Order matches the GPUI palette so muscle
+    /// memory carries between front-ends.
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+        items.push(PaletteItem {
+            label: if self.follow {
+                "Disable follow".into()
+            } else {
+                "Enable follow".into()
+            },
+            kind: PaletteKind::ToggleFollow,
+        });
+        items.push(PaletteItem {
+            label: if self.fold_stacks {
+                "Show stack traces".into()
+            } else {
+                "Fold stack traces".into()
+            },
+            kind: PaletteKind::ToggleStackFolding,
+        });
+        if self.level.is_some() {
+            items.push(PaletteItem {
+                label: "Clear level filter".into(),
+                kind: PaletteKind::ClearLevel,
+            });
+        }
+        for level in [
+            LevelArg::Trace,
+            LevelArg::Debug,
+            LevelArg::Info,
+            LevelArg::Warn,
+            LevelArg::Error,
+            LevelArg::Fatal,
+        ] {
+            items.push(PaletteItem {
+                label: format!("Set level: {}", level_label(Some(level))),
+                kind: PaletteKind::SetLevel(level),
+            });
+        }
+        if !self.engine.session().saved_filters.is_empty() {
+            items.push(PaletteItem {
+                label: "Cycle saved filter".into(),
+                kind: PaletteKind::CycleSavedFilter,
+            });
+            for saved in &self.engine.session().saved_filters {
+                items.push(PaletteItem {
+                    label: format!("Apply saved filter: {}", saved.name),
+                    kind: PaletteKind::ApplySavedFilter(saved.name.to_string()),
+                });
+            }
+        }
+        if !self.filter_text.is_empty() {
+            items.push(PaletteItem {
+                label: "Clear filter text".into(),
+                kind: PaletteKind::ClearFilter,
+            });
+        }
+        if !self.search_text.is_empty() {
+            items.push(PaletteItem {
+                label: "Clear search".into(),
+                kind: PaletteKind::ClearSearch,
+            });
+        }
+        // Apply the user's typed substring filter, case-insensitive.
+        if self.palette_query.is_empty() {
+            items
+        } else {
+            let needle = self.palette_query.to_ascii_lowercase();
+            items
+                .into_iter()
+                .filter(|item| item.label.to_ascii_lowercase().contains(&needle))
+                .collect()
+        }
+    }
+
+    /// Run the currently highlighted palette item and close the palette.
+    fn run_palette_item(&mut self) {
+        let items = self.palette_items();
+        let Some(item) = items.get(self.palette_selected) else {
+            self.mode = InputMode::Normal;
+            return;
+        };
+        match item.kind.clone() {
+            PaletteKind::ToggleFollow => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.snap_to_tail();
+                }
+            }
+            PaletteKind::ToggleStackFolding => {
+                self.fold_stacks = !self.fold_stacks;
+                self.engine.set_stack_trace_folding(self.fold_stacks);
+            }
+            PaletteKind::ClearLevel => {
+                self.level = None;
+                self.apply_current_filters();
+            }
+            PaletteKind::SetLevel(level) => {
+                self.level = Some(level);
+                self.apply_current_filters();
+            }
+            PaletteKind::CycleSavedFilter => self.cycle_saved_filter(),
+            PaletteKind::ApplySavedFilter(name) => match self.engine.apply_saved_filter(&name) {
+                Ok(true) => {
+                    self.status_message = Some(format!("saved filter: {name}"));
+                    self.error_message = None;
+                }
+                Ok(false) | Err(_) => {
+                    self.error_message = Some(format!("could not load saved filter {name}"));
+                }
+            },
+            PaletteKind::ClearFilter => {
+                self.filter_text.clear();
+                self.apply_current_filters();
+            }
+            PaletteKind::ClearSearch => {
+                self.search_text.clear();
+                self.engine.set_search_text(None);
+            }
+        }
+        self.mode = InputMode::Normal;
+        self.palette_query.clear();
+        self.palette_selected = 0;
+        self.refresh_snapshot();
+    }
+
     /// Cycle through the saved filters loaded from `--session`. Order
     /// matches `glowtail-gpui`: None → 0 → 1 → … → N-1 → None.
     fn cycle_saved_filter(&mut self) {
@@ -542,6 +749,9 @@ impl GlowtailIced {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        if self.mode == InputMode::Palette {
+            return self.palette_view();
+        }
         let filter_input = text_input("filter…", &self.filter_text)
             .id(self.filter_input_id.clone())
             .on_input(Message::FilterInputChanged)
@@ -609,6 +819,76 @@ impl GlowtailIced {
             .width(Length::Fill);
 
         column![top_bar, main, detail, footer].spacing(0).into()
+    }
+
+    /// Full-window command palette overlay. Replaces the regular view
+    /// while `mode == Palette` — simpler than building a true modal
+    /// (iced 0.13 has no stack widget) and the UX is the same since
+    /// the user can't interact with anything behind it anyway.
+    fn palette_view(&self) -> Element<'_, Message> {
+        let items = self.palette_items();
+        let mut list = column![].spacing(1);
+        for (index, item) in items.iter().enumerate() {
+            let is_selected = index == self.palette_selected;
+            let entry = container(text(item.label.clone()).size(13).color(if is_selected {
+                Color::from_rgb8(0xff, 0xff, 0xff)
+            } else {
+                Color::from_rgb8(0xc0, 0xc0, 0xc0)
+            }))
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: if is_selected {
+                    Some(Background::Color(Color::from_rgba8(0x22, 0x55, 0x88, 0.6)))
+                } else {
+                    None
+                },
+                ..Default::default()
+            });
+            list = list.push(entry);
+        }
+        let empty_hint = if items.is_empty() {
+            Some(
+                text("no matching commands")
+                    .size(12)
+                    .color(Color::from_rgb8(0x88, 0x88, 0x88)),
+            )
+        } else {
+            None
+        };
+        let palette_input = text_input("type to filter…", &self.palette_query)
+            .id(self.palette_input_id.clone())
+            .on_input(Message::PaletteInputChanged)
+            .on_submit(Message::PaletteSubmitted)
+            .size(14)
+            .padding(6);
+
+        let mut body = column![
+            text("Command palette")
+                .size(14)
+                .color(Color::from_rgb8(0xc8, 0xa2, 0xc8)),
+            palette_input,
+        ]
+        .spacing(8);
+        if let Some(hint) = empty_hint {
+            body = body.push(hint);
+        } else {
+            body = body.push(scrollable(list).height(Length::Fill));
+        }
+        body = body.push(
+            text("↵ run  •  ↑↓ navigate  •  esc close")
+                .size(11)
+                .color(Color::from_rgb8(0x66, 0x66, 0x66)),
+        );
+        container(body)
+            .padding(16)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba8(0x10, 0x10, 0x14, 1.0))),
+                ..Default::default()
+            })
+            .into()
     }
 
     /// Render the source sidebar listing each `SourceSummary` from the
@@ -736,6 +1016,7 @@ impl GlowtailIced {
         match self.mode {
             InputMode::Filter => parts.push("[filter mode: ↵ apply, esc cancel]".into()),
             InputMode::Search => parts.push("[search mode: ↵ apply, esc cancel]".into()),
+            InputMode::Palette => parts.push("[palette: ↵ run, esc close]".into()),
             InputMode::Normal => {}
         }
         parts.join("  •  ")
@@ -743,38 +1024,49 @@ impl GlowtailIced {
 
     fn subscription(&self) -> Subscription<Message> {
         let tick = time::every(POLL_INTERVAL).map(|_| Message::Tick);
-        let keys = keyboard::on_key_press(|key, _modifiers| match key {
-            // Always-on keys — work in any mode.
-            Key::Named(Named::Escape) => Some(Message::EscapePressed),
-            Key::Named(Named::ArrowUp) => Some(Message::SelectionMoveUp),
-            Key::Named(Named::ArrowDown) => Some(Message::SelectionMoveDown),
-            Key::Named(Named::PageUp) => Some(Message::PageUp),
-            Key::Named(Named::PageDown) => Some(Message::PageDown),
-            Key::Named(Named::Home) => Some(Message::HomePressed),
-            Key::Named(Named::End) => Some(Message::EndPressed),
-            // Letter shortcuts — emitted unconditionally; `update` no-ops
-            // them while a text input has focus. See [`InputMode`].
-            Key::Character(ref c) => match c.as_str() {
-                "/" => Some(Message::EnterFilterMode),
-                "?" => Some(Message::EnterSearchMode),
-                "b" => Some(Message::BookmarkToggled),
-                "f" => Some(Message::FollowToggled),
-                "s" => Some(Message::SavedFilterCycled),
-                "n" => Some(Message::NextSearchResult),
-                "N" => Some(Message::PrevSearchResult),
-                "j" => Some(Message::SelectionMoveDown),
-                "k" => Some(Message::SelectionMoveUp),
-                "z" => Some(Message::StackFoldingToggled),
-                "0" => Some(Message::LevelSetTo(None)),
-                "1" => Some(Message::LevelSetTo(Some(LevelArg::Trace))),
-                "2" => Some(Message::LevelSetTo(Some(LevelArg::Debug))),
-                "3" => Some(Message::LevelSetTo(Some(LevelArg::Info))),
-                "4" => Some(Message::LevelSetTo(Some(LevelArg::Warn))),
-                "5" => Some(Message::LevelSetTo(Some(LevelArg::Error))),
-                "6" => Some(Message::LevelSetTo(Some(LevelArg::Fatal))),
+        let keys = keyboard::on_key_press(|key, modifiers| {
+            // Cmd+K / Ctrl+K toggles the palette regardless of which
+            // mode the user is currently in.
+            if modifiers.command()
+                && let Key::Character(ref c) = key
+                && c.as_str() == "k"
+            {
+                return Some(Message::PaletteToggled);
+            }
+            match key {
+                // Always-on keys — work in any mode.
+                Key::Named(Named::Escape) => Some(Message::EscapePressed),
+                Key::Named(Named::ArrowUp) => Some(Message::SelectionMoveUp),
+                Key::Named(Named::ArrowDown) => Some(Message::SelectionMoveDown),
+                Key::Named(Named::PageUp) => Some(Message::PageUp),
+                Key::Named(Named::PageDown) => Some(Message::PageDown),
+                Key::Named(Named::Home) => Some(Message::HomePressed),
+                Key::Named(Named::End) => Some(Message::EndPressed),
+                // Letter shortcuts — emitted unconditionally; `update`
+                // no-ops them while a text input has focus or the
+                // palette is open. See [`InputMode`].
+                Key::Character(ref c) => match c.as_str() {
+                    "/" => Some(Message::EnterFilterMode),
+                    "?" => Some(Message::EnterSearchMode),
+                    "b" => Some(Message::BookmarkToggled),
+                    "f" => Some(Message::FollowToggled),
+                    "s" => Some(Message::SavedFilterCycled),
+                    "n" => Some(Message::NextSearchResult),
+                    "N" => Some(Message::PrevSearchResult),
+                    "j" => Some(Message::SelectionMoveDown),
+                    "k" => Some(Message::SelectionMoveUp),
+                    "z" => Some(Message::StackFoldingToggled),
+                    "0" => Some(Message::LevelSetTo(None)),
+                    "1" => Some(Message::LevelSetTo(Some(LevelArg::Trace))),
+                    "2" => Some(Message::LevelSetTo(Some(LevelArg::Debug))),
+                    "3" => Some(Message::LevelSetTo(Some(LevelArg::Info))),
+                    "4" => Some(Message::LevelSetTo(Some(LevelArg::Warn))),
+                    "5" => Some(Message::LevelSetTo(Some(LevelArg::Error))),
+                    "6" => Some(Message::LevelSetTo(Some(LevelArg::Fatal))),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            }
         });
         Subscription::batch([tick, keys])
     }
