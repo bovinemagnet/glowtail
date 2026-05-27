@@ -1112,7 +1112,10 @@ fn render_row(presentation: &RowPresentation, is_selected: bool) -> Element<'_, 
         row_builder = row_builder.push(text("★").color(Color::from_rgb8(0xff, 0xc8, 0x6b)));
     }
 
-    let mut wrapper = container(row_builder).padding(2).width(Length::Fill);
+    // `Length::Shrink` is mandatory when the parent `scrollable` has
+    // `Direction::Both` — iced panics on a `Fill` horizontal axis
+    // inside a horizontally-scrolling content area.
+    let mut wrapper = container(row_builder).padding(2).width(Length::Shrink);
     if is_selected {
         wrapper = wrapper.style(|_: &Theme| container::Style {
             background: Some(Background::Color(Color::from_rgba8(0x22, 0x55, 0x88, 0.45))),
