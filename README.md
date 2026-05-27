@@ -126,13 +126,15 @@ A command palette, source sidebar, and horizontal scrolling are queued follow-up
 
 ## Makepad Desktop UI
 
-`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. It is the most exploratory of the four siblings — the published `makepad-widgets` crate has a very different mental model from Iced/egui/GPUI, so this crate currently ships at **scaffold** stage: CLI args parsed, engine bootstrapped through `glowtail-ui-common`, and a single status line driven by `Engine::metadata_snapshot`. The `PortalList`-virtualised row view, span-to-colour translation, and live-tail channel bridging are queued follow-ups that bring this front-end up to parity with the others.
+`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. A custom `LogList` widget wraps Makepad's virtualised `PortalList` and is fed the engine's `ViewportSnapshot` each time the live-tail channel produces new rows. A `NextFrame`-driven loop drains the channel without bringing tokio into Makepad's event loop, and the per-row text colour reflects severity via `apply_over` with a dynamic `Vec4`.
 
 ```bash
 cargo run -p glowtail-makepad -- samples/mixed.log
 cargo run -p glowtail-makepad -- samples/mixed.log --filter timeout --level warn
 cargo run -p glowtail-makepad -- samples/mixed.log --session .glowtail-makepad-session.json
 ```
+
+The interactive surface (filter input, search nav, selection cursor, bookmarks, saved-filter cycling, level hotkeys, JSON detail panel) is layer 2 and tracked as an explicit follow-up. Per-span colouring inside a row is also deferred — the current `LogRow` template uses one Label tinted by severity rather than one Label per span.
 
 ### Tailing a log file with glowtail-gpui
 

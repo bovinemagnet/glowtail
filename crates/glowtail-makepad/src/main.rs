@@ -2,13 +2,13 @@
 //! `glowtail-gui` (egui/eframe), `glowtail-gpui` (GPUI), and
 //! `glowtail-iced` (Iced).
 //!
-//! This file is the **scaffold** stage of the plan: it parses CLI flags
-//! identical to the other front-ends, loads the engine via
-//! `glowtail-ui-common` (so session, filter, and tailer plumbing stays in
-//! one place), brings up a Makepad window, and renders a status line
-//! sourced from [`Engine::metadata_snapshot`]. The PortalList-virtualised
-//! row view, `SpanKind`→native colour mapping, live-tail channel bridging,
-//! and feature parity with `glowtail-gpui` are explicit follow-ups.
+//! This commit lifts the crate from scaffold to **viewport rendering**:
+//! a custom [`LogList`] widget wraps `PortalList`, the engine's
+//! [`Engine::viewport`] populates it each frame, and a `NextFrame` event
+//! drains the live-tail channel so newly appended rows appear without a
+//! manual refresh. The interactive surface (filter input, selection
+//! cursor, search nav, bookmarks, saved-filter cycling, level hotkeys,
+//! detail panel) is layer 2 and tracked as an explicit follow-up.
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,6 +20,14 @@ use makepad_widgets::*;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::mpsc::error::TryRecvError;
+
+/// Window over the filtered set requested from the engine each frame.
+/// `PortalList` is internally virtualised — it will only realise widgets
+/// for the rows currently on screen — but we still need a bounded upper
+/// limit so the populate loop terminates. 1024 rows comfortably exceeds
+/// any visible viewport at typical font sizes.
+const PAGE_SIZE: usize = 1024;
 
 #[derive(Debug, Parser, Clone)]
 #[command(name = "glowtail-makepad")]
@@ -79,30 +87,60 @@ live_design! {
     use link::theme::*;
     use link::widgets::*;
 
+    LogListBase = {{LogList}} {}
+
+    pub LogList = <LogListBase> {
+        width: Fill, height: Fill,
+        list = <PortalList> {
+            width: Fill, height: Fill,
+            flow: Down,
+            LogRow = <View> {
+                width: Fill, height: Fit,
+                padding: { top: 2, bottom: 2, left: 6, right: 6 },
+                row_label = <Label> {
+                    width: Fill,
+                    text: "",
+                    draw_text: { text_style: { font_size: 11.0 } }
+                }
+            }
+        }
+    }
+
     App = {{App}} {
         ui: <Root> {
             main_window = <Window> {
                 window: { title: "glowtail (makepad)" },
                 body = <View> {
                     flow: Down,
-                    padding: 12,
-                    spacing: 8,
+                    padding: 0,
+                    spacing: 0,
 
-                    title_label = <Label> {
-                        text: "glowtail — makepad scaffold",
-                        draw_text: { text_style: { font_size: 14.0 } }
+                    header = <View> {
+                        width: Fill, height: Fit,
+                        padding: 8,
+                        spacing: 12,
+                        flow: Right,
+                        title_label = <Label> {
+                            text: "glowtail — makepad",
+                            draw_text: { text_style: { font_size: 13.0 } }
+                        }
+                        status_label = <Label> {
+                            text: "loading…",
+                            draw_text: { text_style: { font_size: 12.0 } }
+                        }
                     }
 
-                    status_label = <Label> {
-                        text: "loading…",
-                        draw_text: { text_style: { font_size: 12.0 } }
-                    }
+                    log_list = <LogList> {}
 
-                    error_label = <Label> {
-                        text: "",
-                        draw_text: {
-                            text_style: { font_size: 12.0 },
-                            color: #ff6b6b,
+                    footer = <View> {
+                        width: Fill, height: Fit,
+                        padding: 6,
+                        error_label = <Label> {
+                            text: "",
+                            draw_text: {
+                                text_style: { font_size: 12.0 },
+                                color: #ff6b6b,
+                            }
                         }
                     }
                 }
@@ -126,11 +164,13 @@ struct AppState {
     engine: Option<Engine>,
     session_path: Option<PathBuf>,
     runtime: Option<Runtime>,
-    /// Held so the `FileTailer` tasks keep running for the app's lifetime.
-    /// Not polled yet — that lands with the live-tail integration step.
-    #[allow(dead_code)]
     live_tail: Option<LiveTail>,
     last_error: Option<String>,
+    /// Always-on poll timer. `NextFrame` events fire once per frame and
+    /// give us a place to drain the tailer channel without bringing tokio
+    /// into Makepad's event loop.
+    next_frame: Option<NextFrame>,
+    follow: bool,
 }
 
 impl LiveRegister for App {
@@ -148,6 +188,11 @@ impl MatchEvent for App {
                 self.refresh_status(cx);
             }
         }
+        // Kick off the per-frame polling loop. Each `NextFrame` handler
+        // re-requests another tick so the loop runs for the app's
+        // lifetime — when there's nothing to do the loop is cheap; when
+        // rows are streaming in it keeps the list current.
+        self.state.next_frame = Some(cx.new_next_frame());
     }
 }
 
@@ -201,6 +246,7 @@ impl App {
             ))
         };
 
+        self.state.follow = live_tail.is_some();
         self.state.engine = Some(engine);
         self.state.session_path = args.session;
         self.state.runtime = Some(runtime);
@@ -215,12 +261,13 @@ impl App {
         let status_text = if let Some(engine) = self.state.engine.as_mut() {
             let snapshot = engine.metadata_snapshot();
             format!(
-                "rows: {} • matching: {} • warn: {} • error: {} • sources: {}",
+                "rows: {} • matching: {} • warn: {} • error: {} • sources: {}{}",
                 snapshot.total_rows,
                 snapshot.total_matching_rows,
                 snapshot.level_counts.warn,
                 snapshot.level_counts.error + snapshot.level_counts.fatal,
                 snapshot.source_summaries.len(),
+                if self.state.follow { " • follow" } else { "" },
             )
         } else {
             String::from("engine not initialised")
@@ -230,12 +277,84 @@ impl App {
         let error_text = self.state.last_error.as_deref().unwrap_or("");
         self.ui.label(id!(error_label)).set_text(cx, error_text);
     }
+
+    /// Drain every pending `LogEvent` from the tailer channel into the
+    /// engine. Returns the number of rows appended so the caller can
+    /// decide whether to scroll the PortalList to the tail.
+    fn drain_events(&mut self) -> usize {
+        let Some(live_tail) = self.state.live_tail.as_mut() else {
+            return 0;
+        };
+        let Some(engine) = self.state.engine.as_mut() else {
+            return 0;
+        };
+        let mut appended = 0;
+        loop {
+            match live_tail.receiver.try_recv() {
+                Ok(LogEvent::RowAppended(row)) => {
+                    engine.append_row(row);
+                    appended += 1;
+                }
+                Ok(LogEvent::SourceAdded { source_id, path }) => {
+                    engine.add_source(source_id, path.display().to_string());
+                }
+                Ok(LogEvent::SourceError { message, .. }) => {
+                    self.state.last_error = Some(message);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        appended
+    }
+
+    /// Snapshot the current viewport rows into the [`LogList`] so its
+    /// next `draw_walk` can render them. Called when the engine state
+    /// changes (live append, filter change) — *not* every frame, so the
+    /// vector copy is bounded by actual UI mutations.
+    fn push_rows_to_list(&mut self, cx: &mut Cx) {
+        let Some(engine) = self.state.engine.as_mut() else {
+            return;
+        };
+        let snapshot = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: PAGE_SIZE,
+        });
+        self.ui
+            .log_list(id!(log_list))
+            .set_rows(cx, snapshot.rows, self.state.follow);
+    }
 }
 
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
+
+        // Per-frame poll: drain the tailer channel, refresh the list
+        // window, refresh the status, schedule the next tick. Doing this
+        // inside `handle_event` (not `handle_actions`) lets us drain on
+        // *any* event including the `NextFrame` we manufactured.
+        if self
+            .state
+            .next_frame
+            .as_ref()
+            .map(|nf| nf.is_event(event).is_some())
+            .unwrap_or(false)
+        {
+            let appended = self.drain_events();
+            if appended > 0 {
+                self.push_rows_to_list(cx);
+                self.refresh_status(cx);
+            }
+            self.state.next_frame = Some(cx.new_next_frame());
+        }
+
+        // On the very first Construct/Draw we don't yet have rows in
+        // the list. Push them once the engine is ready.
+        if let Event::Startup = event {
+            self.push_rows_to_list(cx);
+        }
     }
 }
 
@@ -247,5 +366,106 @@ impl Drop for App {
         {
             eprintln!("warning: failed to save session: {err}");
         }
+    }
+}
+
+/// Custom widget wrapping a `PortalList`. Owns the latest viewport
+/// snapshot and renders one [`LogRow`] template per row. The single
+/// translation seam from `SpanKind`/`SeverityRole` to Makepad colours
+/// lives in [`severity_colour`] / [`row_text`] so the rest of the file
+/// stays engine-agnostic.
+#[derive(Live, LiveHook, Widget)]
+pub struct LogList {
+    #[deref]
+    view: View,
+    #[rust]
+    rows: Vec<RowPresentation>,
+    #[rust]
+    follow: bool,
+}
+
+impl Widget for LogList {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
+            // `set_tail_range` is on `PortalListRef`, not the inner widget,
+            // so call it before borrowing the inner for the populate loop.
+            let portal_list = step.as_portal_list();
+            portal_list.set_tail_range(self.follow);
+            if let Some(mut list) = portal_list.borrow_mut() {
+                let count = self.rows.len();
+                list.set_item_range(cx, 0, count);
+                while let Some(item_id) = list.next_visible_item(cx) {
+                    if let Some(row) = self.rows.get(item_id) {
+                        let item = list.item(cx, item_id, live_id!(LogRow));
+                        let text = row_text(row);
+                        let colour = severity_vec(row.severity_role());
+                        let label = item.label(id!(row_label));
+                        label.set_text(cx, &text);
+                        label.apply_over(cx, live! { draw_text: { color: (colour) } });
+                        item.draw_all(cx, &mut Scope::empty());
+                    }
+                }
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+impl LogListRef {
+    /// Push a new viewport snapshot into the list. The widget redraws on
+    /// the next frame; cheap when called with `follow=true` because
+    /// [`PortalList::set_first_id`] just shifts the cursor to the tail.
+    fn set_rows(&mut self, cx: &mut Cx, rows: Vec<RowPresentation>, follow: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.rows = rows;
+            inner.follow = follow;
+            inner.redraw(cx);
+        }
+    }
+}
+
+/// Flatten a `RowPresentation` into a single line of plain text. The
+/// engine returns rich `StyledSpan`s; for this MVP we drop per-span colour
+/// (the whole row is tinted by severity) and concatenate the text. Full
+/// span-by-span colouring would need one Label per span, which is doable
+/// but explodes widget count — deferred to a follow-up.
+fn row_text(row: &RowPresentation) -> String {
+    let mut out = String::with_capacity(128);
+    if let Some(name) = row.source_name.as_ref() {
+        out.push('[');
+        out.push_str(name);
+        out.push_str("] ");
+    }
+    for span in &row.spans {
+        out.push_str(span.text.as_ref());
+    }
+    if row.is_bookmarked {
+        out.push_str(" ★");
+    }
+    out
+}
+
+/// Severity → makepad colour, as the four-component vec4 the
+/// `draw_text` shader expects. Mirrors the colour palette in
+/// `glowtail-gui::severity_color` / `glowtail-iced::severity_colour`.
+fn severity_vec(role: SeverityRole) -> Vec4 {
+    let (r, g, b) = match role {
+        SeverityRole::Fatal => (0xff, 0x4b, 0x4b),
+        SeverityRole::Error => (0xff, 0x6b, 0x6b),
+        SeverityRole::Warn => (0xff, 0xc8, 0x6b),
+        SeverityRole::Info => (0x88, 0xc8, 0xff),
+        SeverityRole::Debug => (0x80, 0x80, 0x80),
+        SeverityRole::Trace => (0x60, 0x60, 0x60),
+        SeverityRole::Unknown => (0xa0, 0xa0, 0xa0),
+    };
+    Vec4 {
+        x: r as f32 / 255.0,
+        y: g as f32 / 255.0,
+        z: b as f32 / 255.0,
+        w: 1.0,
     }
 }
