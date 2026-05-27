@@ -18,3 +18,6 @@ run-gpui:
 
 run-iced:
 	cargo run -p glowtail-iced -- samples/mixed.log
+
+run-makepad:
+	cargo run -p glowtail-makepad -- samples/mixed.log

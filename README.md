@@ -85,6 +85,16 @@ cargo run -p glowtail-iced -- samples/mixed.log --session .glowtail-iced-session
 
 Search navigation, bookmarks, saved-filter cycling, the command palette, and the JSON detail panel are planned follow-ups that line up with the parity surface already in `glowtail-gpui`.
 
+## Makepad Desktop UI
+
+`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. It is the most exploratory of the four siblings — the published `makepad-widgets` crate has a very different mental model from Iced/egui/GPUI, so this crate currently ships at **scaffold** stage: CLI args parsed, engine bootstrapped through `glowtail-ui-common`, and a single status line driven by `Engine::metadata_snapshot`. The `PortalList`-virtualised row view, span-to-colour translation, and live-tail channel bridging are queued follow-ups that bring this front-end up to parity with the others.
+
+```bash
+cargo run -p glowtail-makepad -- samples/mixed.log
+cargo run -p glowtail-makepad -- samples/mixed.log --filter timeout --level warn
+cargo run -p glowtail-makepad -- samples/mixed.log --session .glowtail-makepad-session.json
+```
+
 | Key | Action |
 |-----|--------|
 | `1` / `2` / `3` / `4` / `5` / `6` | Set `--level` filter to trace / debug / info / warn / error / fatal |
@@ -191,7 +201,7 @@ The same flags work with `view`, so bookmarks made in the TUI can be saved when 
 
 ## Building release binaries
 
-The workspace produces four runnable binaries: `glowtail-cli` (terminal), `glowtail-gui` (egui/wgpu), `glowtail-gpui` (GPUI), and `glowtail-iced` (Iced/wgpu). Release builds land in `target/release/`.
+The workspace produces five runnable binaries: `glowtail-cli` (terminal), `glowtail-gui` (egui/wgpu), `glowtail-gpui` (GPUI), `glowtail-iced` (Iced/wgpu), and `glowtail-makepad` (Makepad). Release builds land in `target/release/`.
 
 Build one binary:
 
@@ -200,9 +210,10 @@ cargo build --release -p glowtail-cli      # → target/release/glowtail-cli
 cargo build --release -p glowtail-gui      # → target/release/glowtail-gui
 cargo build --release -p glowtail-gpui     # → target/release/glowtail-gpui
 cargo build --release -p glowtail-iced     # → target/release/glowtail-iced
+cargo build --release -p glowtail-makepad  # → target/release/glowtail-makepad
 ```
 
-Build all four at once:
+Build all five at once:
 
 ```bash
 cargo build --release --workspace
@@ -215,6 +226,7 @@ Run a built binary directly (no `cargo` afterwards):
 ./target/release/glowtail-gui samples/mixed.log
 ./target/release/glowtail-gpui samples/mixed.log
 ./target/release/glowtail-iced samples/mixed.log
+./target/release/glowtail-makepad samples/mixed.log
 ```
 
 Install into `~/.cargo/bin/` so the binary is on `$PATH`:
@@ -246,6 +258,7 @@ make run-sample # cargo run -p glowtail-cli -- view samples/mixed.log
 make run-gui    # cargo run -p glowtail-gui  -- samples/mixed.log
 make run-gpui   # cargo run -p glowtail-gpui -- samples/mixed.log
 make run-iced   # cargo run -p glowtail-iced -- samples/mixed.log
+make run-makepad # cargo run -p glowtail-makepad -- samples/mixed.log
 ```
 
 For the optional large-viewport smoke benchmark:

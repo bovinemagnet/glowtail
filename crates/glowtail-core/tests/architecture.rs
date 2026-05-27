@@ -49,7 +49,15 @@ fn viewport_returns_filtered_semantic_rows_without_ui_types() {
 fn core_crate_has_no_ui_dependencies() {
     let manifest =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
-    for forbidden in ["ratatui", "crossterm", "egui", "gpui", "wgpu", "iced"] {
+    for forbidden in [
+        "ratatui",
+        "crossterm",
+        "egui",
+        "gpui",
+        "wgpu",
+        "iced",
+        "makepad-widgets",
+    ] {
         assert!(
             !manifest.contains(forbidden),
             "forbidden dependency found: {forbidden}"

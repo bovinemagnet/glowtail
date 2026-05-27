@@ -7,6 +7,7 @@ members = [
   "crates/glowtail-gui",
   "crates/glowtail-gpui",
   "crates/glowtail-iced",
+  "crates/glowtail-makepad",
 ]
 resolver = "2"
 
@@ -23,6 +24,7 @@ crossterm = "0.28"
 eframe = { version = "0.28", features = ["wgpu"] }
 gpui = "0.2.2"
 iced = { version = "0.13", features = ["tokio"] }
+makepad-widgets = "1.0"
 ratatui = "0.28"
 regex = "1"
 serde = { version = "1", features = ["derive", "rc"] }
