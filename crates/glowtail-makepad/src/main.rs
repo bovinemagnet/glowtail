@@ -14,12 +14,12 @@
 //! and search text input (`?`) with the same Normal/Filter/Search
 //! `InputMode` gating that `glowtail-iced` uses.
 //!
-//! Layer 3 (chrome): JSON detail panel for the selected row, search-
-//! match row highlighting. Per-span colouring inside a row remains a
-//! known gap — Makepad's retained-widget model doesn't lend itself to
-//! the per-`StyledSpan` `<div>` per row the other front-ends use, so
-//! the whole row is currently tinted by severity. A source sidebar and
-//! command palette also stay queued.
+//! Layer 3 (chrome): source sidebar, JSON detail panel, command
+//! palette (Cmd/Ctrl+K), search-match row highlighting, per-span
+//! colouring across a static 16-slot `LogRow` template — spans
+//! beyond the cap fold into a `…` truncation marker. Only horizontal
+//! scrolling for messages wider than the viewport remains as a known
+//! Makepad-specific gap.
 
 use anyhow::Result;
 use clap::Parser;
@@ -108,11 +108,31 @@ live_design! {
             LogRow = <View> {
                 width: Fill, height: Fit,
                 padding: { top: 2, bottom: 2, left: 6, right: 6 },
-                row_label = <Label> {
-                    width: Fill,
+                flow: Right,
+                source_tag = <Label> {
                     text: "",
-                    draw_text: { text_style: { font_size: 11.0 } }
+                    draw_text: { text_style: { font_size: 11.0 }, color: #888888 }
                 }
+                bookmark_marker = <Label> {
+                    text: "",
+                    draw_text: { text_style: { font_size: 11.0 }, color: #ffc86b }
+                }
+                span_0 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_1 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_2 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_3 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_4 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_5 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_6 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_7 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_8 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_9 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_10 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_11 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_12 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_13 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_14 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
+                span_15 = <Label> { text: "", draw_text: { text_style: { font_size: 11.0 } } }
             }
         }
     }
@@ -1197,8 +1217,6 @@ impl Widget for LogList {
                     if let Some(row) = self.rows.get(item_id) {
                         let is_selected = self.selected_row_id == Some(row.row_id);
                         let item = list.item(cx, item_id, live_id!(LogRow));
-                        let text = row_text(row);
-                        let text_colour = severity_vec(row.severity_role());
                         // Selection wins over match wins over bookmark in
                         // terms of background. Matches use a translucent
                         // yellow so the search hit stands out even when
@@ -1241,9 +1259,48 @@ impl Widget for LogList {
                                 draw_bg: { color: (bg_colour) },
                             },
                         );
-                        let label = item.label(id!(row_label));
-                        label.set_text(cx, &text);
-                        label.apply_over(cx, live! { draw_text: { color: (text_colour) } });
+                        // Populate the source tag and bookmark marker
+                        // first, then walk up to 16 span slots. Spans
+                        // beyond the cap fold into the last visible
+                        // slot so very long rows still show their tail
+                        // even though they truncate inside a row.
+                        let source_text = row
+                            .source_name
+                            .as_ref()
+                            .map(|name| format!("[{name}] "))
+                            .unwrap_or_default();
+                        item.label(id!(source_tag)).set_text(cx, &source_text);
+                        let bookmark_text = if row.is_bookmarked { "★ " } else { "" };
+                        item.label(id!(bookmark_marker)).set_text(cx, bookmark_text);
+                        let role = row.severity_role();
+                        let mut last_used_slot = 0usize;
+                        for (slot_index, span) in row.spans.iter().take(SPAN_SLOT_COUNT).enumerate()
+                        {
+                            let colour = span_colour(span.kind, role);
+                            let label = item.label(span_slot_id(slot_index));
+                            label.set_text(cx, span.text.as_ref());
+                            label.apply_over(
+                                cx,
+                                live! {
+                                    visible: true,
+                                    draw_text: { color: (colour) },
+                                },
+                            );
+                            last_used_slot = slot_index + 1;
+                        }
+                        // If the row's span count overflows the cap,
+                        // append a truncation marker to the last slot.
+                        if row.spans.len() > SPAN_SLOT_COUNT {
+                            let label = item.label(span_slot_id(SPAN_SLOT_COUNT - 1));
+                            label.set_text(cx, "…");
+                            last_used_slot = SPAN_SLOT_COUNT;
+                        }
+                        // Hide the rest of the slots so the next row
+                        // doesn't show stale text from a previous one.
+                        for slot_index in last_used_slot..SPAN_SLOT_COUNT {
+                            item.label(span_slot_id(slot_index))
+                                .apply_over(cx, live! { visible: false });
+                        }
                         item.draw_all(cx, &mut Scope::empty());
                     }
                 }
@@ -1277,26 +1334,13 @@ impl LogListRef {
     }
 }
 
-/// Flatten a `RowPresentation` into a single line of plain text. The
-/// engine returns rich `StyledSpan`s; for this MVP we drop per-span colour
-/// (the whole row is tinted by severity) and concatenate the text. Full
-/// span-by-span colouring would need one Label per span, which is doable
-/// but explodes widget count — deferred to a follow-up.
-fn row_text(row: &RowPresentation) -> String {
-    let mut out = String::with_capacity(128);
-    if let Some(name) = row.source_name.as_ref() {
-        out.push('[');
-        out.push_str(name);
-        out.push_str("] ");
-    }
-    for span in &row.spans {
-        out.push_str(span.text.as_ref());
-    }
-    if row.is_bookmarked {
-        out.push_str(" ★");
-    }
-    out
-}
+/// Number of span slots in the static `LogRow` template. Spans
+/// beyond this cap fold into a single `…` marker in the last slot —
+/// the realistic upper bound on engine-produced spans is around 10
+/// (timestamp, separator, level, separator, message, JSON envelope,
+/// up to ~3 key/value triplets), so 16 is generous without exploding
+/// the template's widget count.
+const SPAN_SLOT_COUNT: usize = 16;
 
 fn level_label(level: Option<LevelArg>) -> &'static str {
     match level {
@@ -1310,23 +1354,69 @@ fn level_label(level: Option<LevelArg>) -> &'static str {
     }
 }
 
-/// Severity → makepad colour, as the four-component vec4 the
-/// `draw_text` shader expects. Mirrors the colour palette in
-/// `glowtail-gui::severity_color` / `glowtail-iced::severity_colour`.
-fn severity_vec(role: SeverityRole) -> Vec4 {
-    let (r, g, b) = match role {
-        SeverityRole::Fatal => (0xff, 0x4b, 0x4b),
-        SeverityRole::Error => (0xff, 0x6b, 0x6b),
-        SeverityRole::Warn => (0xff, 0xc8, 0x6b),
-        SeverityRole::Info => (0x88, 0xc8, 0xff),
-        SeverityRole::Debug => (0x80, 0x80, 0x80),
-        SeverityRole::Trace => (0x60, 0x60, 0x60),
-        SeverityRole::Unknown => (0xa0, 0xa0, 0xa0),
-    };
+fn rgb_to_vec4(r: u8, g: u8, b: u8) -> Vec4 {
     Vec4 {
         x: r as f32 / 255.0,
         y: g as f32 / 255.0,
         z: b as f32 / 255.0,
         w: 1.0,
+    }
+}
+
+/// Severity → makepad colour, as the four-component vec4 the
+/// `draw_text` shader expects. Mirrors the colour palette in
+/// `glowtail-gui::severity_color` / `glowtail-iced::severity_colour`.
+fn severity_vec(role: SeverityRole) -> Vec4 {
+    match role {
+        SeverityRole::Fatal => rgb_to_vec4(0xff, 0x4b, 0x4b),
+        SeverityRole::Error => rgb_to_vec4(0xff, 0x6b, 0x6b),
+        SeverityRole::Warn => rgb_to_vec4(0xff, 0xc8, 0x6b),
+        SeverityRole::Info => rgb_to_vec4(0x88, 0xc8, 0xff),
+        SeverityRole::Debug => rgb_to_vec4(0x80, 0x80, 0x80),
+        SeverityRole::Trace => rgb_to_vec4(0x60, 0x60, 0x60),
+        SeverityRole::Unknown => rgb_to_vec4(0xa0, 0xa0, 0xa0),
+    }
+}
+
+/// Single translation seam: semantic `SpanKind` to native Vec4.
+/// Mirrors `glowtail-iced::span_colour` / `glowtail-gpui::span_color`.
+fn span_colour(kind: SpanKind, role: SeverityRole) -> Vec4 {
+    match kind {
+        SpanKind::Timestamp => rgb_to_vec4(0x8a, 0xb4, 0xf8),
+        SpanKind::Level => severity_vec(role),
+        SpanKind::Source => rgb_to_vec4(0xc8, 0xa2, 0xc8),
+        SpanKind::Message => rgb_to_vec4(0xe6, 0xe6, 0xe6),
+        SpanKind::JsonKey => rgb_to_vec4(0xc8, 0xa2, 0xc8),
+        SpanKind::JsonValue => rgb_to_vec4(0xfb, 0xbc, 0x04),
+        SpanKind::SearchMatch => rgb_to_vec4(0xff, 0xeb, 0x3b),
+        SpanKind::Error => rgb_to_vec4(0xff, 0x6b, 0x6b),
+        SpanKind::Warning => rgb_to_vec4(0xff, 0xc8, 0x6b),
+        SpanKind::StackTrace => rgb_to_vec4(0xa0, 0xa0, 0xa0),
+        _ => rgb_to_vec4(0xe6, 0xe6, 0xe6),
+    }
+}
+
+/// Resolve a slot index (0..[`SPAN_SLOT_COUNT`]) to the `id!()` path
+/// for that slot's Label. Makepad's `id!` macro is compile-time, so a
+/// match arm per slot is the simplest way to bridge a runtime index
+/// into the right widget reference.
+fn span_slot_id(index: usize) -> &'static [LiveId] {
+    match index {
+        0 => id!(span_0),
+        1 => id!(span_1),
+        2 => id!(span_2),
+        3 => id!(span_3),
+        4 => id!(span_4),
+        5 => id!(span_5),
+        6 => id!(span_6),
+        7 => id!(span_7),
+        8 => id!(span_8),
+        9 => id!(span_9),
+        10 => id!(span_10),
+        11 => id!(span_11),
+        12 => id!(span_12),
+        13 => id!(span_13),
+        14 => id!(span_14),
+        _ => id!(span_15),
     }
 }
