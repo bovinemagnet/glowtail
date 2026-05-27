@@ -26,7 +26,11 @@ fn plain_line(id: usize) -> String {
     // level token, service identifier, free text. Enough variability that the
     // string-search hot path inside the parser isn't trivially branch-predicted
     // to the same outcome for every row.
-    let level = if id.is_multiple_of(10) { "ERROR" } else { "INFO" };
+    let level = if id.is_multiple_of(10) {
+        "ERROR"
+    } else {
+        "INFO"
+    };
     format!(
         "2026-05-26T10:15:{:02}.000Z {level} service=billing request_id=req-{id} message=handling request",
         id % 60
@@ -39,7 +43,11 @@ fn json_line(id: usize) -> String {
     // duration_ms). Two of those names are stripped to `log.level` /
     // `message`; the rest hit `parse_fields` and the per-field `Arc<str>`
     // allocation that PH2 flags.
-    let level = if id.is_multiple_of(10) { "ERROR" } else { "INFO" };
+    let level = if id.is_multiple_of(10) {
+        "ERROR"
+    } else {
+        "INFO"
+    };
     format!(
         "{{\"timestamp\":\"2026-05-26T10:15:{:02}.000Z\",\"level\":\"{level}\",\"message\":\"handling request {id}\",\"service\":\"billing\",\"request_id\":\"req-{id}\",\"trace_id\":\"trace-{id:08x}\",\"span_id\":\"span-{id:08x}\",\"host\":\"api-{id_host}\",\"env\":\"prod\",\"duration_ms\":{dur}}}",
         id % 60,

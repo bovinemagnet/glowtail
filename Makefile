@@ -15,3 +15,6 @@ run-gui:
 
 run-gpui:
 	cargo run -p glowtail-gpui -- samples/mixed.log
+
+run-iced:
+	cargo run -p glowtail-iced -- samples/mixed.log

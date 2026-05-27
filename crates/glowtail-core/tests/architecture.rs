@@ -44,12 +44,12 @@ fn viewport_returns_filtered_semantic_rows_without_ui_types() {
 /// Catches *direct* UI dependencies in `glowtail-core/Cargo.toml`. A
 /// transitive UI dep (e.g. a future internal helper crate that re-exports
 /// ratatui types) would slip past this check; if the dep graph ever grows
-/// past the four UI crates, replace this with a `cargo metadata` walk.
+/// past the current UI crates, replace this with a `cargo metadata` walk.
 #[test]
 fn core_crate_has_no_ui_dependencies() {
     let manifest =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
-    for forbidden in ["ratatui", "crossterm", "egui", "gpui", "wgpu"] {
+    for forbidden in ["ratatui", "crossterm", "egui", "gpui", "wgpu", "iced"] {
         assert!(
             !manifest.contains(forbidden),
             "forbidden dependency found: {forbidden}"

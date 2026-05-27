@@ -72,6 +72,19 @@ By default the GPUI app follows appended lines through the shared `glowtail-core
 
 The GPUI prototype now has row selection, bookmarks, in-window search with n/N navigation, a Cmd/Ctrl+K command palette, and keyboard-driven filtering — feature parity with `glowtail-gui` for the core interactive surface.
 
+## Iced Desktop UI
+
+`glowtail-iced` is a third native desktop front-end built on [Iced](https://iced.rs/), the Elm-inspired retained-mode toolkit with a wgpu renderer. Like the other UIs it consumes `glowtail-core` through `Engine::viewport` and `glowtail-ui-common` for session, filter, and live-tail plumbing — the only crate-local logic is the `SpanKind`→`iced::Color` mapping. The MVP supports preload, live tail, filter text, level filter, follow toggle, and paged keyboard navigation (Home/End/PageUp/PageDown).
+
+```bash
+cargo run -p glowtail-iced -- samples/mixed.log
+cargo run -p glowtail-iced -- samples/json.log --json
+cargo run -p glowtail-iced -- samples/mixed.log --filter timeout --level warn
+cargo run -p glowtail-iced -- samples/mixed.log --session .glowtail-iced-session.json
+```
+
+Search navigation, bookmarks, saved-filter cycling, the command palette, and the JSON detail panel are planned follow-ups that line up with the parity surface already in `glowtail-gpui`.
+
 | Key | Action |
 |-----|--------|
 | `1` / `2` / `3` / `4` / `5` / `6` | Set `--level` filter to trace / debug / info / warn / error / fatal |
@@ -178,7 +191,7 @@ The same flags work with `view`, so bookmarks made in the TUI can be saved when 
 
 ## Building release binaries
 
-The workspace produces three runnable binaries: `glowtail-cli` (terminal), `glowtail-gui` (egui/wgpu), and `glowtail-gpui` (GPUI). Release builds land in `target/release/`.
+The workspace produces four runnable binaries: `glowtail-cli` (terminal), `glowtail-gui` (egui/wgpu), `glowtail-gpui` (GPUI), and `glowtail-iced` (Iced/wgpu). Release builds land in `target/release/`.
 
 Build one binary:
 
@@ -186,9 +199,10 @@ Build one binary:
 cargo build --release -p glowtail-cli      # → target/release/glowtail-cli
 cargo build --release -p glowtail-gui      # → target/release/glowtail-gui
 cargo build --release -p glowtail-gpui     # → target/release/glowtail-gpui
+cargo build --release -p glowtail-iced     # → target/release/glowtail-iced
 ```
 
-Build all three at once:
+Build all four at once:
 
 ```bash
 cargo build --release --workspace
@@ -200,6 +214,7 @@ Run a built binary directly (no `cargo` afterwards):
 ./target/release/glowtail-cli view samples/mixed.log
 ./target/release/glowtail-gui samples/mixed.log
 ./target/release/glowtail-gpui samples/mixed.log
+./target/release/glowtail-iced samples/mixed.log
 ```
 
 Install into `~/.cargo/bin/` so the binary is on `$PATH`:
@@ -230,6 +245,7 @@ make test       # cargo test
 make run-sample # cargo run -p glowtail-cli -- view samples/mixed.log
 make run-gui    # cargo run -p glowtail-gui  -- samples/mixed.log
 make run-gpui   # cargo run -p glowtail-gpui -- samples/mixed.log
+make run-iced   # cargo run -p glowtail-iced -- samples/mixed.log
 ```
 
 For the optional large-viewport smoke benchmark:

@@ -1,0 +1,13 @@
+[package]
+name = "glowtail-iced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+glowtail-core = { path = "../glowtail-core" }
+glowtail-ui-common = { path = "../glowtail-ui-common" }
+iced.workspace = true
+tokio.workspace = true
