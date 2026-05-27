@@ -150,7 +150,34 @@ live_design! {
                         }
                     }
 
-                    log_list = <LogList> {}
+                    main_row = <View> {
+                        width: Fill, height: Fill,
+                        flow: Right,
+                        sidebar = <View> {
+                            width: 220, height: Fill,
+                            padding: 8,
+                            flow: Down,
+                            spacing: 4,
+                            show_bg: true,
+                            draw_bg: { color: #14141a },
+                            sidebar_title = <Label> {
+                                text: "Sources",
+                                draw_text: {
+                                    text_style: { font_size: 12.0 },
+                                    color: #c8a2c8,
+                                }
+                            }
+                            sources_label = <Label> {
+                                width: Fill,
+                                text: "",
+                                draw_text: {
+                                    text_style: { font_size: 11.0 },
+                                    color: #e6e6e6,
+                                }
+                            }
+                        }
+                        log_list = <LogList> {}
+                    }
 
                     detail_panel = <View> {
                         width: Fill, height: Fit,
@@ -184,6 +211,39 @@ live_design! {
                             draw_text: {
                                 text_style: { font_size: 12.0 },
                                 color: #ff6b6b,
+                            }
+                        }
+                    }
+
+                    palette_view = <View> {
+                        width: Fill, height: Fill,
+                        padding: 24,
+                        spacing: 8,
+                        flow: Down,
+                        visible: false,
+                        show_bg: true,
+                        draw_bg: { color: #101014 },
+                        palette_title = <Label> {
+                            text: "Command palette",
+                            draw_text: {
+                                text_style: { font_size: 14.0 },
+                                color: #c8a2c8,
+                            }
+                        }
+                        palette_input = <TextInput> {
+                            width: Fill, height: Fit,
+                            empty_text: "type to filter…",
+                        }
+                        palette_items_label = <Label> {
+                            width: Fill,
+                            text: "",
+                            draw_text: { text_style: { font_size: 12.0 } }
+                        }
+                        palette_hint = <Label> {
+                            text: "↵ run  •  ↑↓/jk navigate  •  esc close",
+                            draw_text: {
+                                text_style: { font_size: 10.0 },
+                                color: #666666,
                             }
                         }
                     }
@@ -235,20 +295,46 @@ struct AppState {
     /// header row.
     fold_stacks: bool,
     /// Which text input (if any) has key focus. `/` enters Filter mode,
-    /// `?` enters Search mode; Escape (via `TextInput::escaped`) or
-    /// Enter (via `TextInput::returned`) returns to Normal.
+    /// `?` enters Search mode, `Cmd+K`/`Ctrl+K` enters Palette mode.
     mode: InputMode,
+    /// Substring used to filter command palette items, mirrored from
+    /// the `palette_input` TextInput on every `changed` action.
+    palette_query: String,
+    /// Index of the highlighted palette item. Reset to 0 whenever the
+    /// query changes so the cursor never points past the filtered set.
+    palette_selected: usize,
 }
 
 /// Single-letter shortcuts only fire in `Normal` mode — when the
-/// filter/search inputs have key focus all character keys are consumed
-/// by the TextInput. Mirrors the gating in `glowtail-iced`.
+/// filter/search/palette inputs have key focus all character keys are
+/// consumed by the TextInput. Mirrors the gating in `glowtail-iced`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     #[default]
     Normal,
     Filter,
     Search,
+    Palette,
+}
+
+/// A single command palette entry. Mirrors `glowtail-iced::PaletteItem`
+/// so muscle memory carries between front-ends.
+#[derive(Debug, Clone)]
+struct PaletteItem {
+    label: String,
+    kind: PaletteKind,
+}
+
+#[derive(Debug, Clone)]
+enum PaletteKind {
+    ToggleFollow,
+    ToggleStackFolding,
+    ClearLevel,
+    SetLevel(LevelArg),
+    CycleSavedFilter,
+    ApplySavedFilter(String),
+    ClearFilter,
+    ClearSearch,
 }
 
 impl LiveRegister for App {
@@ -284,6 +370,21 @@ impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let filter = self.ui.text_input(id!(filter_input));
         let search = self.ui.text_input(id!(search_input));
+        let palette = self.ui.text_input(id!(palette_input));
+
+        if let Some(query) = palette.changed(actions) {
+            self.state.palette_query = query;
+            self.state.palette_selected = 0;
+            self.refresh_palette_items(cx);
+        }
+        if palette.returned(actions).is_some() {
+            self.run_palette_item(cx);
+            self.push_rows_to_list(cx);
+            self.refresh_status(cx);
+        }
+        if palette.escaped(actions) {
+            self.close_palette(cx);
+        }
 
         if let Some((text, _)) = filter.returned(actions) {
             self.state.filter_text = text;
@@ -503,6 +604,199 @@ impl App {
         }
     }
 
+    /// Open the command palette overlay. Hides the regular body so
+    /// only the palette is visible and focuses the palette input so
+    /// typing immediately filters.
+    fn open_palette(&mut self, cx: &mut Cx) {
+        self.state.mode = InputMode::Palette;
+        self.state.palette_query.clear();
+        self.state.palette_selected = 0;
+        self.toggle_palette_visibility(cx, true);
+        let ti = self.ui.text_input(id!(palette_input));
+        if let Some(inner) = ti.borrow_mut() {
+            inner.set_key_focus(cx);
+        }
+        ti.set_text(cx, "");
+        self.refresh_palette_items(cx);
+    }
+
+    fn close_palette(&mut self, cx: &mut Cx) {
+        self.state.mode = InputMode::Normal;
+        self.state.palette_query.clear();
+        self.state.palette_selected = 0;
+        self.toggle_palette_visibility(cx, false);
+    }
+
+    fn toggle_palette_visibility(&mut self, cx: &mut Cx, palette_open: bool) {
+        let visible_main = !palette_open;
+        for id in [id!(header), id!(main_row), id!(footer)] {
+            self.ui
+                .view(id)
+                .apply_over(cx, live! { visible: (visible_main) });
+        }
+        // The detail panel hides itself when no JSON fields are
+        // present, so only force it back on if the palette is opening.
+        if palette_open {
+            self.ui
+                .view(id!(detail_panel))
+                .apply_over(cx, live! { visible: false });
+        }
+        self.ui
+            .view(id!(palette_view))
+            .apply_over(cx, live! { visible: (palette_open) });
+    }
+
+    /// Build the list of palette items based on the current engine
+    /// state. Items mirror the iced front-end exactly so users keep
+    /// the same vocabulary across siblings.
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+        items.push(PaletteItem {
+            label: if self.state.follow {
+                "Disable follow".into()
+            } else {
+                "Enable follow".into()
+            },
+            kind: PaletteKind::ToggleFollow,
+        });
+        items.push(PaletteItem {
+            label: if self.state.fold_stacks {
+                "Show stack traces".into()
+            } else {
+                "Fold stack traces".into()
+            },
+            kind: PaletteKind::ToggleStackFolding,
+        });
+        if self.state.level.is_some() {
+            items.push(PaletteItem {
+                label: "Clear level filter".into(),
+                kind: PaletteKind::ClearLevel,
+            });
+        }
+        for level in [
+            LevelArg::Trace,
+            LevelArg::Debug,
+            LevelArg::Info,
+            LevelArg::Warn,
+            LevelArg::Error,
+            LevelArg::Fatal,
+        ] {
+            items.push(PaletteItem {
+                label: format!("Set level: {}", level_label(Some(level))),
+                kind: PaletteKind::SetLevel(level),
+            });
+        }
+        if let Some(engine) = self.state.engine.as_ref()
+            && !engine.session().saved_filters.is_empty()
+        {
+            items.push(PaletteItem {
+                label: "Cycle saved filter".into(),
+                kind: PaletteKind::CycleSavedFilter,
+            });
+            for saved in &engine.session().saved_filters {
+                items.push(PaletteItem {
+                    label: format!("Apply saved filter: {}", saved.name),
+                    kind: PaletteKind::ApplySavedFilter(saved.name.to_string()),
+                });
+            }
+        }
+        if !self.state.filter_text.is_empty() {
+            items.push(PaletteItem {
+                label: "Clear filter text".into(),
+                kind: PaletteKind::ClearFilter,
+            });
+        }
+        if self.state.engine.is_some() {
+            items.push(PaletteItem {
+                label: "Clear search".into(),
+                kind: PaletteKind::ClearSearch,
+            });
+        }
+        if self.state.palette_query.is_empty() {
+            items
+        } else {
+            let needle = self.state.palette_query.to_ascii_lowercase();
+            items
+                .into_iter()
+                .filter(|item| item.label.to_ascii_lowercase().contains(&needle))
+                .collect()
+        }
+    }
+
+    fn refresh_palette_items(&mut self, cx: &mut Cx) {
+        let items = self.palette_items();
+        let max = items.len().saturating_sub(1);
+        if self.state.palette_selected > max {
+            self.state.palette_selected = max;
+        }
+        let body = if items.is_empty() {
+            String::from("(no matching commands)")
+        } else {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    if index == self.state.palette_selected {
+                        format!("▶ {}", item.label)
+                    } else {
+                        format!("  {}", item.label)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.ui.label(id!(palette_items_label)).set_text(cx, &body);
+    }
+
+    /// Execute the currently highlighted palette item and close the
+    /// palette. Selected, query, and visibility all reset.
+    fn run_palette_item(&mut self, cx: &mut Cx) {
+        let items = self.palette_items();
+        let Some(item) = items.get(self.state.palette_selected).cloned() else {
+            self.close_palette(cx);
+            return;
+        };
+        match item.kind {
+            PaletteKind::ToggleFollow => self.state.follow = !self.state.follow,
+            PaletteKind::ToggleStackFolding => self.toggle_stack_folding(),
+            PaletteKind::ClearLevel => {
+                self.state.level = None;
+                self.reapply_filters();
+            }
+            PaletteKind::SetLevel(level) => {
+                self.state.level = Some(level);
+                self.reapply_filters();
+            }
+            PaletteKind::CycleSavedFilter => self.cycle_saved_filter(),
+            PaletteKind::ApplySavedFilter(name) => {
+                if let Some(engine) = self.state.engine.as_mut() {
+                    match engine.apply_saved_filter(&name) {
+                        Ok(true) => {
+                            self.state.status_message = Some(format!("saved filter: {name}"));
+                            self.state.last_error = None;
+                        }
+                        Ok(false) | Err(_) => {
+                            self.state.last_error =
+                                Some(format!("could not load saved filter {name}"));
+                        }
+                    }
+                }
+            }
+            PaletteKind::ClearFilter => {
+                self.state.filter_text.clear();
+                self.ui.text_input(id!(filter_input)).set_text(cx, "");
+                self.reapply_filters();
+            }
+            PaletteKind::ClearSearch => {
+                self.ui.text_input(id!(search_input)).set_text(cx, "");
+                if let Some(engine) = self.state.engine.as_mut() {
+                    engine.set_search_text(None);
+                }
+            }
+        }
+        self.close_palette(cx);
+    }
+
     fn refresh_status(&mut self, cx: &mut Cx) {
         let status_text = if let Some(engine) = self.state.engine.as_mut() {
             let snapshot = engine.metadata_snapshot();
@@ -605,6 +899,26 @@ impl App {
             .and_then(|id| snapshot.rows.iter().find(|row| row.row_id == id))
             .map(|row| row.json_fields())
             .unwrap_or_default();
+        // Build the sidebar text from the snapshot's source summaries
+        // before we hand ownership of snapshot.rows away. The format
+        // mirrors the iced front-end's sidebar so the chrome reads the
+        // same across the four siblings.
+        let sources_text = if snapshot.source_summaries.is_empty() {
+            String::from("(no sources)")
+        } else {
+            snapshot
+                .source_summaries
+                .iter()
+                .map(|s| {
+                    let errors = s.level_counts.error + s.level_counts.fatal;
+                    format!(
+                        "{}\n  {} rows  {}W  {}E",
+                        s.name, s.rows, s.level_counts.warn, errors
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         self.ui.log_list(id!(log_list)).set_state(
             cx,
             snapshot.rows,
@@ -612,6 +926,9 @@ impl App {
             self.state.selected_row_id,
             selection_position,
         );
+        self.ui
+            .label(id!(sources_label))
+            .set_text(cx, &sources_text);
         self.refresh_detail_panel(cx, &detail_fields);
     }
 
@@ -680,6 +997,40 @@ impl AppMain for App {
 
 impl App {
     fn handle_key_down(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        // Cmd+K (or Ctrl+K) toggles the palette regardless of mode.
+        // KeyModifiers::is_primary() handles the macOS-vs-others split.
+        if matches!(key.key_code, KeyCode::KeyK) && key.modifiers.is_primary() {
+            if self.state.mode == InputMode::Palette {
+                self.close_palette(cx);
+            } else {
+                self.open_palette(cx);
+            }
+            return;
+        }
+
+        // While the palette is open, j/k or arrows navigate items.
+        if self.state.mode == InputMode::Palette {
+            match key.key_code {
+                KeyCode::ArrowUp | KeyCode::KeyK => {
+                    self.state.palette_selected = self.state.palette_selected.saturating_sub(1);
+                    self.refresh_palette_items(cx);
+                }
+                KeyCode::ArrowDown | KeyCode::KeyJ => {
+                    let max = self.palette_items().len().saturating_sub(1);
+                    self.state.palette_selected = (self.state.palette_selected + 1).min(max);
+                    self.refresh_palette_items(cx);
+                }
+                KeyCode::ReturnKey => {
+                    self.run_palette_item(cx);
+                    self.push_rows_to_list(cx);
+                    self.refresh_status(cx);
+                }
+                KeyCode::Escape => self.close_palette(cx),
+                _ => {}
+            }
+            return;
+        }
+
         // `/` and `?` are always-on entry points to focus the inputs.
         // Both rely on the TextInputRef::borrow_mut path because
         // `set_key_focus` is on the inner `TextInput`, not its Ref.
