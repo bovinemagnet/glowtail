@@ -15,7 +15,9 @@ use glowtail_ui_common::{
 };
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{Row, button, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Color, Element, Length, Subscription, Task, time};
+use iced::{
+    Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme, time,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,16 +84,47 @@ fn main() -> Result<()> {
         .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
+/// Which text input (if any) currently has focus. Single-letter shortcuts
+/// (b, n, f, j/k, 0-6, s, /, ?) only fire in [`InputMode::Normal`] — the
+/// keyboard subscription always emits them, but the update handler gates
+/// them by mode so typing into a focused filter/search input doesn't
+/// accidentally toggle bookmarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    Filter,
+    Search,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     FilterInputChanged(String),
     FilterSubmitted,
     SearchInputChanged(String),
     SearchSubmitted,
+    /// `/` — focus and select the filter input.
+    EnterFilterMode,
+    /// `?` — focus and select the search input.
+    EnterSearchMode,
+    /// Escape — exit any active input mode and return to Normal.
+    EscapePressed,
     LevelCycled,
+    /// `0`-`6` — set the level filter to a specific severity (None for `0`).
+    LevelSetTo(Option<LevelArg>),
     FollowToggled,
-    LineUp,
-    LineDown,
+    /// `s` — cycle through the saved filters loaded from `--session`.
+    /// Order: None → first → … → last → None.
+    SavedFilterCycled,
+    /// `b` — toggle bookmark on the currently selected row.
+    BookmarkToggled,
+    /// `n` / `N` — jump the selection cursor to the next/previous search
+    /// result and scroll the viewport to keep it visible.
+    NextSearchResult,
+    PrevSearchResult,
+    /// `j` / `↓` — move the row-selection cursor down by one row.
+    SelectionMoveDown,
+    /// `k` / `↑` — move the row-selection cursor up by one row.
+    SelectionMoveUp,
     PageUp,
     PageDown,
     HomePressed,
@@ -109,6 +142,18 @@ struct GlowtailIced {
     cached_rows: Vec<RowPresentation>,
     total_matching_rows: usize,
     total_rows: usize,
+    /// Row currently under the selection cursor. Anchors bookmark toggles
+    /// and the detail panel. `None` means "no selection yet" — the first
+    /// `j`/`↓` press picks the top of the viewport.
+    selected_row_id: Option<RowId>,
+    /// Position into `cached_rows` for the saved-filter cycle. `None` means
+    /// "no saved filter active". Mirrors the `s`-cycling state in
+    /// `glowtail-gpui` so users can move between front-ends without
+    /// rebuilding muscle memory.
+    saved_filter_index: Option<usize>,
+    mode: InputMode,
+    filter_input_id: text_input::Id,
+    search_input_id: text_input::Id,
     session_path: Option<PathBuf>,
     /// Kept alive to host the `FileTailer` tasks. Dropped *after*
     /// `live_tail` so the runtime drives the tasks to completion when the
@@ -186,6 +231,11 @@ impl GlowtailIced {
             cached_rows: Vec::new(),
             total_matching_rows: 0,
             total_rows: 0,
+            selected_row_id: None,
+            saved_filter_index: None,
+            mode: InputMode::Normal,
+            filter_input_id: text_input::Id::unique(),
+            search_input_id: text_input::Id::unique(),
             session_path: args.session,
             runtime,
             live_tail,
@@ -241,6 +291,17 @@ impl GlowtailIced {
         self.first_row = self.total_matching_rows.saturating_sub(PAGE_SIZE);
     }
 
+    /// Scroll the viewport so that the row at `position` (within the
+    /// filtered set) is visible. Used by selection navigation and the
+    /// n/N search keys so the cursor doesn't disappear off-screen.
+    fn scroll_to_position(&mut self, position: usize) {
+        if position < self.first_row {
+            self.first_row = position;
+        } else if position >= self.first_row + PAGE_SIZE {
+            self.first_row = position.saturating_sub(PAGE_SIZE - 1);
+        }
+    }
+
     fn apply_current_filters(&mut self) {
         match apply_filters(
             &mut self.engine,
@@ -255,16 +316,39 @@ impl GlowtailIced {
         self.refresh_snapshot();
     }
 
+    fn move_selection(&mut self, delta: isize) -> Task<Message> {
+        if self.total_matching_rows == 0 {
+            return Task::none();
+        }
+        self.follow = false;
+        let current_position = self
+            .selected_row_id
+            .and_then(|id| self.engine.filtered_position_for_row(id))
+            .unwrap_or(self.first_row);
+        let max = self.total_matching_rows.saturating_sub(1) as isize;
+        let new_position = (current_position as isize + delta).clamp(0, max) as usize;
+        if let Some(row) = self.engine.present_row_at(new_position) {
+            self.selected_row_id = Some(row.row_id);
+            self.scroll_to_position(new_position);
+        }
+        self.refresh_snapshot();
+        Task::none()
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::FilterInputChanged(value) => {
                 self.filter_text = value;
+                Task::none()
             }
             Message::FilterSubmitted => {
                 self.apply_current_filters();
+                self.mode = InputMode::Normal;
+                Task::none()
             }
             Message::SearchInputChanged(value) => {
                 self.search_text = value;
+                Task::none()
             }
             Message::SearchSubmitted => {
                 let search = if self.search_text.is_empty() {
@@ -274,51 +358,89 @@ impl GlowtailIced {
                 };
                 self.engine.set_search_text(search);
                 self.refresh_snapshot();
+                self.mode = InputMode::Normal;
+                Task::none()
+            }
+            Message::EnterFilterMode => {
+                self.mode = InputMode::Filter;
+                text_input::focus(self.filter_input_id.clone())
+            }
+            Message::EnterSearchMode => {
+                self.mode = InputMode::Search;
+                text_input::focus(self.search_input_id.clone())
+            }
+            Message::EscapePressed => {
+                self.mode = InputMode::Normal;
+                Task::none()
             }
             Message::LevelCycled => {
                 self.level = cycle_level(self.level);
                 self.apply_current_filters();
+                Task::none()
             }
-            Message::FollowToggled => {
+            Message::LevelSetTo(level) if self.mode == InputMode::Normal => {
+                self.level = level;
+                self.apply_current_filters();
+                Task::none()
+            }
+            Message::FollowToggled if self.mode == InputMode::Normal => {
                 self.follow = !self.follow;
                 if self.follow {
                     self.snap_to_tail();
                     self.refresh_snapshot();
                 }
+                Task::none()
             }
-            Message::LineUp => {
-                self.follow = false;
-                self.first_row = self.first_row.saturating_sub(1);
-                self.refresh_snapshot();
+            Message::SavedFilterCycled if self.mode == InputMode::Normal => {
+                self.cycle_saved_filter();
+                Task::none()
             }
-            Message::LineDown => {
-                self.follow = false;
-                self.first_row =
-                    (self.first_row + 1).min(self.total_matching_rows.saturating_sub(1).max(0));
-                self.refresh_snapshot();
+            Message::BookmarkToggled if self.mode == InputMode::Normal => {
+                if let Some(row_id) = self.selected_row_id {
+                    self.engine.toggle_bookmark(row_id, None);
+                    self.refresh_snapshot();
+                } else {
+                    self.status_message =
+                        Some("select a row first (j/k or ↑/↓) before bookmarking".into());
+                }
+                Task::none()
             }
-            Message::PageUp => {
+            Message::NextSearchResult if self.mode == InputMode::Normal => {
+                self.jump_search(false);
+                Task::none()
+            }
+            Message::PrevSearchResult if self.mode == InputMode::Normal => {
+                self.jump_search(true);
+                Task::none()
+            }
+            Message::SelectionMoveUp if self.mode == InputMode::Normal => self.move_selection(-1),
+            Message::SelectionMoveDown if self.mode == InputMode::Normal => self.move_selection(1),
+            Message::PageUp if self.mode == InputMode::Normal => {
                 self.follow = false;
                 self.first_row = self.first_row.saturating_sub(PAGE_SIZE);
                 self.refresh_snapshot();
+                Task::none()
             }
-            Message::PageDown => {
+            Message::PageDown if self.mode == InputMode::Normal => {
                 self.follow = false;
                 self.first_row = self
                     .first_row
                     .saturating_add(PAGE_SIZE)
-                    .min(self.total_matching_rows.saturating_sub(1).max(0));
+                    .min(self.total_matching_rows.saturating_sub(1));
                 self.refresh_snapshot();
+                Task::none()
             }
-            Message::HomePressed => {
+            Message::HomePressed if self.mode == InputMode::Normal => {
                 self.follow = false;
                 self.first_row = 0;
                 self.refresh_snapshot();
+                Task::none()
             }
-            Message::EndPressed => {
+            Message::EndPressed if self.mode == InputMode::Normal => {
                 self.follow = true;
                 self.snap_to_tail();
                 self.refresh_snapshot();
+                Task::none()
             }
             Message::Tick => {
                 let appended = self.drain_events();
@@ -328,18 +450,83 @@ impl GlowtailIced {
                 if appended || self.follow {
                     self.refresh_snapshot();
                 }
+                Task::none()
+            }
+            // Single-letter and selection-shortcut messages emitted while a
+            // text input has focus fall through here. The text input has
+            // already consumed the keystroke via its own `on_input` handler;
+            // ignoring the shortcut leaves the typed character in the
+            // input and prevents accidental UI toggles mid-type.
+            _ => Task::none(),
+        }
+    }
+
+    /// Jump the selection cursor to the next/previous search match and
+    /// scroll the viewport so it stays visible. `glowtail-gpui` uses the
+    /// same engine method, so n/N feels identical between front-ends.
+    fn jump_search(&mut self, reverse: bool) {
+        let Some(next) = self
+            .engine
+            .next_search_result(self.selected_row_id, reverse)
+        else {
+            self.status_message = Some("no search matches".into());
+            return;
+        };
+        self.selected_row_id = Some(next);
+        if let Some(position) = self.engine.filtered_position_for_row(next) {
+            self.scroll_to_position(position);
+        }
+        self.follow = false;
+        self.refresh_snapshot();
+    }
+
+    /// Cycle through the saved filters loaded from `--session`. Order
+    /// matches `glowtail-gpui`: None → 0 → 1 → … → N-1 → None.
+    fn cycle_saved_filter(&mut self) {
+        let count = self.engine.session().saved_filters.len();
+        if count == 0 {
+            self.status_message = Some("no saved filters in session".into());
+            return;
+        }
+        let next_index = match self.saved_filter_index {
+            None => Some(0),
+            Some(i) if i + 1 < count => Some(i + 1),
+            Some(_) => None,
+        };
+        self.saved_filter_index = next_index;
+        match next_index {
+            Some(index) => {
+                let name = self.engine.session().saved_filters[index].name.clone();
+                match self.engine.apply_saved_filter(&name) {
+                    Ok(true) => {
+                        self.error_message = None;
+                        self.status_message = Some(format!("saved filter: {name}"));
+                    }
+                    Ok(false) | Err(_) => {
+                        self.error_message = Some(format!("could not load saved filter {name}"));
+                    }
+                }
+            }
+            None => {
+                // Returning to "no saved filter" — clear and re-apply the
+                // typed filter/level state so the user lands where they
+                // started, not on an empty FilterExpr::All.
+                self.apply_current_filters();
+                self.status_message = Some("saved filter: (none)".into());
             }
         }
-        Task::none()
+        self.refresh_snapshot();
     }
 
     fn view(&self) -> Element<'_, Message> {
         let filter_input = text_input("filter…", &self.filter_text)
+            .id(self.filter_input_id.clone())
             .on_input(Message::FilterInputChanged)
             .on_submit(Message::FilterSubmitted)
             .width(Length::FillPortion(3));
 
-        let search_input = text_input("search…", &self.search_text)
+        let search_input = text_input("search (?)", &self.search_text)
+            .id(self.search_input_id.clone())
             .on_input(Message::SearchInputChanged)
             .on_submit(Message::SearchSubmitted)
             .width(Length::FillPortion(2));
@@ -354,23 +541,89 @@ impl GlowtailIced {
         };
         let follow_button = button(text(follow_label)).on_press(Message::FollowToggled);
 
-        let top_bar = row![filter_input, search_input, level_button, follow_button,]
-            .spacing(8)
-            .padding(8)
-            .align_y(Alignment::Center);
+        let saved_label = match self.saved_filter_index {
+            Some(index) => format!("saved: {}", self.engine.session().saved_filters[index].name),
+            None => String::from("saved: (none)"),
+        };
+        let saved_button = button(text(saved_label)).on_press(Message::SavedFilterCycled);
+
+        let top_bar = row![
+            filter_input,
+            search_input,
+            level_button,
+            follow_button,
+            saved_button,
+        ]
+        .spacing(8)
+        .padding(8)
+        .align_y(Alignment::Center);
 
         let mut rows_column = column![].spacing(2);
+        let selected_id = self.selected_row_id;
         for row_presentation in &self.cached_rows {
-            rows_column = rows_column.push(render_row(row_presentation));
+            let is_selected = selected_id == Some(row_presentation.row_id);
+            rows_column = rows_column.push(render_row(row_presentation, is_selected));
         }
         let body = scrollable(container(rows_column).padding(8)).height(Length::Fill);
+
+        let detail = self.detail_panel();
 
         let status = self.status_line();
         let footer = container(text(status).size(12))
             .padding(6)
             .width(Length::Fill);
 
-        column![top_bar, body, footer].spacing(0).into()
+        column![top_bar, body, detail, footer].spacing(0).into()
+    }
+
+    /// Render the JSON detail panel for the currently selected row. Empty
+    /// when no selection (or no JSON fields on the selected row) so the
+    /// layout doesn't shift around as the user navigates.
+    fn detail_panel(&self) -> Element<'_, Message> {
+        let Some(row) = self
+            .selected_row_id
+            .and_then(|id| self.cached_rows.iter().find(|row| row.row_id == id))
+        else {
+            return container(text("")).height(Length::Fixed(0.0)).into();
+        };
+        let fields = row.json_fields();
+        if fields.is_empty() {
+            return container(text("")).height(Length::Fixed(0.0)).into();
+        }
+        let mut col = column![
+            text("JSON detail")
+                .size(13)
+                .color(Color::from_rgb8(0xc8, 0xa2, 0xc8))
+        ]
+        .spacing(2);
+        for (key, value) in fields {
+            col = col.push(
+                row![
+                    text(key.to_string())
+                        .size(12)
+                        .color(Color::from_rgb8(0xc8, 0xa2, 0xc8))
+                        .width(Length::Fixed(160.0)),
+                    text(value.to_string())
+                        .size(12)
+                        .color(Color::from_rgb8(0xfb, 0xbc, 0x04)),
+                ]
+                .spacing(8),
+            );
+        }
+        container(col)
+            .padding(8)
+            .width(Length::Fill)
+            .height(Length::Shrink)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba8(0x1a, 0x1a, 0x1a, 1.0))),
+                border: Border {
+                    width: 1.0,
+                    color: Color::from_rgb8(0x33, 0x33, 0x33),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
     fn status_line(&self) -> String {
@@ -384,18 +637,46 @@ impl GlowtailIced {
         } else if let Some(status) = self.status_message.as_ref() {
             parts.push(status.clone());
         }
+        match self.mode {
+            InputMode::Filter => parts.push("[filter mode: ↵ apply, esc cancel]".into()),
+            InputMode::Search => parts.push("[search mode: ↵ apply, esc cancel]".into()),
+            InputMode::Normal => {}
+        }
         parts.join("  •  ")
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let tick = time::every(POLL_INTERVAL).map(|_| Message::Tick);
         let keys = keyboard::on_key_press(|key, _modifiers| match key {
-            Key::Named(Named::ArrowUp) => Some(Message::LineUp),
-            Key::Named(Named::ArrowDown) => Some(Message::LineDown),
+            // Always-on keys — work in any mode.
+            Key::Named(Named::Escape) => Some(Message::EscapePressed),
+            Key::Named(Named::ArrowUp) => Some(Message::SelectionMoveUp),
+            Key::Named(Named::ArrowDown) => Some(Message::SelectionMoveDown),
             Key::Named(Named::PageUp) => Some(Message::PageUp),
             Key::Named(Named::PageDown) => Some(Message::PageDown),
             Key::Named(Named::Home) => Some(Message::HomePressed),
             Key::Named(Named::End) => Some(Message::EndPressed),
+            // Letter shortcuts — emitted unconditionally; `update` no-ops
+            // them while a text input has focus. See [`InputMode`].
+            Key::Character(ref c) => match c.as_str() {
+                "/" => Some(Message::EnterFilterMode),
+                "?" => Some(Message::EnterSearchMode),
+                "b" => Some(Message::BookmarkToggled),
+                "f" => Some(Message::FollowToggled),
+                "s" => Some(Message::SavedFilterCycled),
+                "n" => Some(Message::NextSearchResult),
+                "N" => Some(Message::PrevSearchResult),
+                "j" => Some(Message::SelectionMoveDown),
+                "k" => Some(Message::SelectionMoveUp),
+                "0" => Some(Message::LevelSetTo(None)),
+                "1" => Some(Message::LevelSetTo(Some(LevelArg::Trace))),
+                "2" => Some(Message::LevelSetTo(Some(LevelArg::Debug))),
+                "3" => Some(Message::LevelSetTo(Some(LevelArg::Info))),
+                "4" => Some(Message::LevelSetTo(Some(LevelArg::Warn))),
+                "5" => Some(Message::LevelSetTo(Some(LevelArg::Error))),
+                "6" => Some(Message::LevelSetTo(Some(LevelArg::Fatal))),
+                _ => None,
+            },
             _ => None,
         });
         Subscription::batch([tick, keys])
@@ -412,9 +693,9 @@ impl Drop for GlowtailIced {
     }
 }
 
-fn render_row(presentation: &RowPresentation) -> Row<'_, Message> {
+fn render_row(presentation: &RowPresentation, is_selected: bool) -> Element<'_, Message> {
     let role = presentation.severity_role();
-    let mut row_builder = row![
+    let mut row_builder: Row<'_, Message> = row![
         text(severity_glyph(role))
             .color(severity_colour(role))
             .size(14)
@@ -442,7 +723,28 @@ fn render_row(presentation: &RowPresentation) -> Row<'_, Message> {
         row_builder = row_builder.push(text("★").color(Color::from_rgb8(0xff, 0xc8, 0x6b)));
     }
 
-    row_builder
+    let mut wrapper = container(row_builder).padding(2).width(Length::Fill);
+    if is_selected {
+        wrapper = wrapper.style(|_: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba8(0x22, 0x55, 0x88, 0.45))),
+            border: Border {
+                width: 1.0,
+                color: Color::from_rgb8(0x55, 0x99, 0xff),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    } else if presentation.is_bookmarked {
+        wrapper = wrapper.style(|_: &Theme| container::Style {
+            border: Border {
+                width: 1.0,
+                color: Color::from_rgba8(0xff, 0xc8, 0x6b, 0.5),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+    wrapper.into()
 }
 
 fn severity_glyph(role: SeverityRole) -> &'static str {

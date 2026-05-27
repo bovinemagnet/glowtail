@@ -72,29 +72,6 @@ By default the GPUI app follows appended lines through the shared `glowtail-core
 
 The GPUI prototype now has row selection, bookmarks, in-window search with n/N navigation, a Cmd/Ctrl+K command palette, and keyboard-driven filtering — feature parity with `glowtail-gui` for the core interactive surface.
 
-## Iced Desktop UI
-
-`glowtail-iced` is a third native desktop front-end built on [Iced](https://iced.rs/), the Elm-inspired retained-mode toolkit with a wgpu renderer. Like the other UIs it consumes `glowtail-core` through `Engine::viewport` and `glowtail-ui-common` for session, filter, and live-tail plumbing — the only crate-local logic is the `SpanKind`→`iced::Color` mapping. The MVP supports preload, live tail, filter text, level filter, follow toggle, and paged keyboard navigation (Home/End/PageUp/PageDown).
-
-```bash
-cargo run -p glowtail-iced -- samples/mixed.log
-cargo run -p glowtail-iced -- samples/json.log --json
-cargo run -p glowtail-iced -- samples/mixed.log --filter timeout --level warn
-cargo run -p glowtail-iced -- samples/mixed.log --session .glowtail-iced-session.json
-```
-
-Search navigation, bookmarks, saved-filter cycling, the command palette, and the JSON detail panel are planned follow-ups that line up with the parity surface already in `glowtail-gpui`.
-
-## Makepad Desktop UI
-
-`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. It is the most exploratory of the four siblings — the published `makepad-widgets` crate has a very different mental model from Iced/egui/GPUI, so this crate currently ships at **scaffold** stage: CLI args parsed, engine bootstrapped through `glowtail-ui-common`, and a single status line driven by `Engine::metadata_snapshot`. The `PortalList`-virtualised row view, span-to-colour translation, and live-tail channel bridging are queued follow-ups that bring this front-end up to parity with the others.
-
-```bash
-cargo run -p glowtail-makepad -- samples/mixed.log
-cargo run -p glowtail-makepad -- samples/mixed.log --filter timeout --level warn
-cargo run -p glowtail-makepad -- samples/mixed.log --session .glowtail-makepad-session.json
-```
-
 | Key | Action |
 |-----|--------|
 | `1` / `2` / `3` / `4` / `5` / `6` | Set `--level` filter to trace / debug / info / warn / error / fatal |
@@ -116,6 +93,46 @@ cargo run -p glowtail-makepad -- samples/mixed.log --session .glowtail-makepad-s
 | `Cmd+k` / `Ctrl+k` | Toggle the command palette (j/k or arrows to select, `enter` to run, `escape` to close) |
 
 The text input is intentionally minimal: append-only, no cursor positioning, no IME composition. Use `escape` to discard a partial edit.
+
+## Iced Desktop UI
+
+`glowtail-iced` is a third native desktop front-end built on [Iced](https://iced.rs/), the Elm-inspired retained-mode toolkit with a wgpu renderer. Like the other UIs it consumes `glowtail-core` through `Engine::viewport` and `glowtail-ui-common` for session, filter, and live-tail plumbing — the only crate-local logic is the `SpanKind`→`iced::Color` mapping.
+
+```bash
+cargo run -p glowtail-iced -- samples/mixed.log
+cargo run -p glowtail-iced -- samples/json.log --json
+cargo run -p glowtail-iced -- samples/mixed.log --filter timeout --level warn
+cargo run -p glowtail-iced -- samples/mixed.log --session .glowtail-iced-session.json
+```
+
+The interactive surface mirrors the GPUI front-end keybindings: a row selection cursor, search-result navigation, bookmarks, saved-filter cycling, level hotkeys, and a JSON detail panel for the selected row. The keyboard subscription emits shortcuts unconditionally; the update handler gates them by an `InputMode` so single letters fire only when the filter/search input doesn't have focus.
+
+| Key | Action |
+|-----|--------|
+| `1` / `2` / `3` / `4` / `5` / `6` | Set `--level` filter to trace / debug / info / warn / error / fatal |
+| `0` | Clear the level filter |
+| `s` | Cycle through saved filters loaded from `--session` (none → first → … → last → none) |
+| `/` | Focus the filter text input |
+| `?` | Focus the search input |
+| `enter` | Apply the input you're editing (filter text or search needle) |
+| `escape` | Exit input mode and return to Normal |
+| `↑` / `↓` / `j` / `k` | Move the row-selection cursor up / down (auto-scrolls; disables follow) |
+| `PgUp` / `PgDn` / `Home` / `End` | Scroll a page or jump to the top/bottom (`End` re-engages follow) |
+| `f` | Toggle follow mode (auto-scroll to the bottom on appended rows) |
+| `b` | Bookmark (or unbookmark) the selected row — persists via `--session` |
+| `n` / `N` | Jump to the next / previous search match (auto-scrolls and moves the selection cursor) |
+
+A command palette, source sidebar, and horizontal scrolling are queued follow-ups; the rest of the interactive surface is at parity with `glowtail-gpui`.
+
+## Makepad Desktop UI
+
+`glowtail-makepad` is a fourth native desktop front-end built on [Makepad](https://makepad.nl/), a shader-based renderer with its own `live_design!` DSL. It is the most exploratory of the four siblings — the published `makepad-widgets` crate has a very different mental model from Iced/egui/GPUI, so this crate currently ships at **scaffold** stage: CLI args parsed, engine bootstrapped through `glowtail-ui-common`, and a single status line driven by `Engine::metadata_snapshot`. The `PortalList`-virtualised row view, span-to-colour translation, and live-tail channel bridging are queued follow-ups that bring this front-end up to parity with the others.
+
+```bash
+cargo run -p glowtail-makepad -- samples/mixed.log
+cargo run -p glowtail-makepad -- samples/mixed.log --filter timeout --level warn
+cargo run -p glowtail-makepad -- samples/mixed.log --session .glowtail-makepad-session.json
+```
 
 ### Tailing a log file with glowtail-gpui
 
