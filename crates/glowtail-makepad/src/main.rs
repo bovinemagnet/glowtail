@@ -121,13 +121,22 @@ live_design! {
                     header = <View> {
                         width: Fill, height: Fit,
                         padding: 8,
-                        spacing: 12,
+                        spacing: 8,
                         flow: Right,
                         title_label = <Label> {
-                            text: "glowtail — makepad",
+                            text: "glowtail",
                             draw_text: { text_style: { font_size: 13.0 } }
                         }
+                        filter_input = <TextInput> {
+                            width: 240, height: Fit,
+                            empty_text: "filter…",
+                        }
+                        search_input = <TextInput> {
+                            width: 200, height: Fit,
+                            empty_text: "search…",
+                        }
                         status_label = <Label> {
+                            width: Fill,
                             text: "loading…",
                             draw_text: { text_style: { font_size: 12.0 } }
                         }
@@ -193,6 +202,21 @@ struct AppState {
     /// lines of a stack trace are hidden behind a folded badge on the
     /// header row.
     fold_stacks: bool,
+    /// Which text input (if any) has key focus. `/` enters Filter mode,
+    /// `?` enters Search mode; Escape (via `TextInput::escaped`) or
+    /// Enter (via `TextInput::returned`) returns to Normal.
+    mode: InputMode,
+}
+
+/// Single-letter shortcuts only fire in `Normal` mode — when the
+/// filter/search inputs have key focus all character keys are consumed
+/// by the TextInput. Mirrors the gating in `glowtail-iced`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    #[default]
+    Normal,
+    Filter,
+    Search,
 }
 
 impl LiveRegister for App {
@@ -204,7 +228,15 @@ impl LiveRegister for App {
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         match self.bootstrap() {
-            Ok(()) => self.refresh_status(cx),
+            Ok(()) => {
+                // Seed the filter input with any --filter from the CLI so
+                // the user can edit it without retyping.
+                let filter_text = self.state.filter_text.clone();
+                self.ui
+                    .text_input(id!(filter_input))
+                    .set_text(cx, &filter_text);
+                self.refresh_status(cx);
+            }
             Err(err) => {
                 self.state.last_error = Some(err.to_string());
                 self.refresh_status(cx);
@@ -215,6 +247,44 @@ impl MatchEvent for App {
         // lifetime — when there's nothing to do the loop is cheap; when
         // rows are streaming in it keeps the list current.
         self.state.next_frame = Some(cx.new_next_frame());
+    }
+
+    fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let filter = self.ui.text_input(id!(filter_input));
+        let search = self.ui.text_input(id!(search_input));
+
+        if let Some((text, _)) = filter.returned(actions) {
+            self.state.filter_text = text;
+            self.reapply_filters();
+            self.state.mode = InputMode::Normal;
+            self.push_rows_to_list(cx);
+            self.refresh_status(cx);
+        }
+        if filter.escaped(actions) {
+            // Restore the previously-applied filter and leave focus.
+            let filter_text = self.state.filter_text.clone();
+            filter.set_text(cx, &filter_text);
+            self.state.mode = InputMode::Normal;
+        }
+
+        if let Some((text, _)) = search.returned(actions) {
+            let needle = if text.is_empty() { None } else { Some(text) };
+            if let Some(engine) = self.state.engine.as_mut() {
+                engine.set_search_text(needle);
+            }
+            self.state.mode = InputMode::Normal;
+            self.push_rows_to_list(cx);
+            self.refresh_status(cx);
+        }
+        if search.escaped(actions) {
+            search.set_text(cx, "");
+            if let Some(engine) = self.state.engine.as_mut() {
+                engine.set_search_text(None);
+            }
+            self.state.mode = InputMode::Normal;
+            self.push_rows_to_list(cx);
+            self.refresh_status(cx);
+        }
     }
 }
 
@@ -546,6 +616,27 @@ impl AppMain for App {
 
 impl App {
     fn handle_key_down(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        // `/` and `?` are always-on entry points to focus the inputs.
+        // Both rely on the TextInputRef::borrow_mut path because
+        // `set_key_focus` is on the inner `TextInput`, not its Ref.
+        if matches!(key.key_code, KeyCode::Slash) && !key.modifiers.shift {
+            self.focus_filter_input(cx);
+            self.state.mode = InputMode::Filter;
+            return;
+        }
+        if matches!(key.key_code, KeyCode::Slash) && key.modifiers.shift {
+            self.focus_search_input(cx);
+            self.state.mode = InputMode::Search;
+            return;
+        }
+
+        // Every other key is mode-sensitive. When a text input has
+        // focus the TextInput widget consumes character keys and emits
+        // `Returned`/`Escaped` actions handled in `handle_actions`.
+        if self.state.mode != InputMode::Normal {
+            return;
+        }
+
         let mut state_changed = true;
         match key.key_code {
             KeyCode::ArrowUp | KeyCode::KeyK => {
@@ -609,6 +700,20 @@ impl App {
         if state_changed {
             self.push_rows_to_list(cx);
             self.refresh_status(cx);
+        }
+    }
+
+    fn focus_filter_input(&mut self, cx: &mut Cx) {
+        let ti = self.ui.text_input(id!(filter_input));
+        if let Some(inner) = ti.borrow_mut() {
+            inner.set_key_focus(cx);
+        }
+    }
+
+    fn focus_search_input(&mut self, cx: &mut Cx) {
+        let ti = self.ui.text_input(id!(search_input));
+        if let Some(inner) = ti.borrow_mut() {
+            inner.set_key_focus(cx);
         }
     }
 }
