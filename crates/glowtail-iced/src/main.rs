@@ -9,12 +9,16 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use glowtail_core::model::SourceSummary;
 use glowtail_core::prelude::*;
 use glowtail_ui_common::{
     LevelArg, LiveTail, apply_filters, load_session, parser_from_flags, save_session, start_tailers,
 };
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{Row, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Row, button, column, container, row, scrollable, scrollable::Direction, scrollable::Scrollbar,
+    text, text_input,
+};
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme, time,
 };
@@ -125,6 +129,8 @@ enum Message {
     SelectionMoveDown,
     /// `k` / `↑` — move the row-selection cursor up by one row.
     SelectionMoveUp,
+    /// `z` — toggle stack-trace folding (`engine.set_stack_trace_folding`).
+    StackFoldingToggled,
     PageUp,
     PageDown,
     HomePressed,
@@ -140,6 +146,11 @@ struct GlowtailIced {
     follow: bool,
     first_row: usize,
     cached_rows: Vec<RowPresentation>,
+    /// Source summaries from the most recent snapshot. Renders into the
+    /// left sidebar so the user can see at a glance which files are
+    /// contributing rows under the current filter — same shape as the
+    /// gpui front-end's sidebar.
+    cached_sources: Vec<SourceSummary>,
     total_matching_rows: usize,
     total_rows: usize,
     /// Row currently under the selection cursor. Anchors bookmark toggles
@@ -152,6 +163,9 @@ struct GlowtailIced {
     /// rebuilding muscle memory.
     saved_filter_index: Option<usize>,
     mode: InputMode,
+    /// `z` toggle — when `true` the engine collapses stack-trace
+    /// continuation lines into the header row's folded badge.
+    fold_stacks: bool,
     filter_input_id: text_input::Id,
     search_input_id: text_input::Id,
     session_path: Option<PathBuf>,
@@ -229,11 +243,13 @@ impl GlowtailIced {
             follow,
             first_row: 0,
             cached_rows: Vec::new(),
+            cached_sources: Vec::new(),
             total_matching_rows: 0,
             total_rows: 0,
             selected_row_id: None,
             saved_filter_index: None,
             mode: InputMode::Normal,
+            fold_stacks: false,
             filter_input_id: text_input::Id::unique(),
             search_input_id: text_input::Id::unique(),
             session_path: args.session,
@@ -285,6 +301,7 @@ impl GlowtailIced {
         self.total_matching_rows = snapshot.total_matching_rows;
         self.total_rows = snapshot.total_rows;
         self.cached_rows = snapshot.rows;
+        self.cached_sources = snapshot.source_summaries;
     }
 
     fn snap_to_tail(&mut self) {
@@ -415,6 +432,12 @@ impl GlowtailIced {
             }
             Message::SelectionMoveUp if self.mode == InputMode::Normal => self.move_selection(-1),
             Message::SelectionMoveDown if self.mode == InputMode::Normal => self.move_selection(1),
+            Message::StackFoldingToggled if self.mode == InputMode::Normal => {
+                self.fold_stacks = !self.fold_stacks;
+                self.engine.set_stack_trace_folding(self.fold_stacks);
+                self.refresh_snapshot();
+                Task::none()
+            }
             Message::PageUp if self.mode == InputMode::Normal => {
                 self.follow = false;
                 self.first_row = self.first_row.saturating_sub(PAGE_SIZE);
@@ -564,7 +587,19 @@ impl GlowtailIced {
             let is_selected = selected_id == Some(row_presentation.row_id);
             rows_column = rows_column.push(render_row(row_presentation, is_selected));
         }
-        let body = scrollable(container(rows_column).padding(8)).height(Length::Fill);
+        let body = scrollable(container(rows_column).padding(8))
+            .direction(Direction::Both {
+                vertical: Scrollbar::default(),
+                horizontal: Scrollbar::default(),
+            })
+            .height(Length::Fill)
+            .width(Length::Fill);
+
+        let sidebar = self.source_sidebar();
+        let main = row![sidebar, body]
+            .spacing(0)
+            .height(Length::Fill)
+            .width(Length::Fill);
 
         let detail = self.detail_panel();
 
@@ -573,7 +608,68 @@ impl GlowtailIced {
             .padding(6)
             .width(Length::Fill);
 
-        column![top_bar, body, detail, footer].spacing(0).into()
+        column![top_bar, main, detail, footer].spacing(0).into()
+    }
+
+    /// Render the source sidebar listing each `SourceSummary` from the
+    /// most recent viewport snapshot. Mirrors the gpui front-end: the
+    /// row counts and severity totals come from
+    /// `Engine::viewport().source_summaries`, so they reflect whatever
+    /// filter/level is active.
+    fn source_sidebar(&self) -> Element<'_, Message> {
+        let mut col = column![
+            text("Sources")
+                .size(12)
+                .color(Color::from_rgb8(0xc8, 0xa2, 0xc8))
+        ]
+        .spacing(4);
+        if self.cached_sources.is_empty() {
+            col = col.push(
+                text("(no sources)")
+                    .size(11)
+                    .color(Color::from_rgb8(0x88, 0x88, 0x88)),
+            );
+        } else {
+            for summary in &self.cached_sources {
+                let counts = &summary.level_counts;
+                let total = counts.error + counts.fatal;
+                let warn = counts.warn;
+                col = col.push(
+                    column![
+                        text(summary.name.to_string())
+                            .size(12)
+                            .color(Color::from_rgb8(0xe6, 0xe6, 0xe6)),
+                        row![
+                            text(format!("{} rows", summary.rows))
+                                .size(10)
+                                .color(Color::from_rgb8(0x88, 0x88, 0x88)),
+                            text(format!("{warn}W"))
+                                .size(10)
+                                .color(Color::from_rgb8(0xff, 0xc8, 0x6b)),
+                            text(format!("{total}E"))
+                                .size(10)
+                                .color(Color::from_rgb8(0xff, 0x6b, 0x6b)),
+                        ]
+                        .spacing(8),
+                    ]
+                    .spacing(1),
+                );
+            }
+        }
+        container(scrollable(col))
+            .padding(8)
+            .width(Length::Fixed(220.0))
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba8(0x14, 0x14, 0x18, 1.0))),
+                border: Border {
+                    width: 1.0,
+                    color: Color::from_rgb8(0x33, 0x33, 0x33),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
     /// Render the JSON detail panel for the currently selected row. Empty
@@ -668,6 +764,7 @@ impl GlowtailIced {
                 "N" => Some(Message::PrevSearchResult),
                 "j" => Some(Message::SelectionMoveDown),
                 "k" => Some(Message::SelectionMoveUp),
+                "z" => Some(Message::StackFoldingToggled),
                 "0" => Some(Message::LevelSetTo(None)),
                 "1" => Some(Message::LevelSetTo(Some(LevelArg::Trace))),
                 "2" => Some(Message::LevelSetTo(Some(LevelArg::Debug))),
