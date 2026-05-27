@@ -2,13 +2,16 @@
 //! `glowtail-gui` (egui/eframe), `glowtail-gpui` (GPUI), and
 //! `glowtail-iced` (Iced).
 //!
-//! This commit lifts the crate from scaffold to **viewport rendering**:
-//! a custom [`LogList`] widget wraps `PortalList`, the engine's
-//! [`Engine::viewport`] populates it each frame, and a `NextFrame` event
-//! drains the live-tail channel so newly appended rows appear without a
-//! manual refresh. The interactive surface (filter input, selection
-//! cursor, search nav, bookmarks, saved-filter cycling, level hotkeys,
-//! detail panel) is layer 2 and tracked as an explicit follow-up.
+//! Layer 1 (viewport rendering): a custom [`LogList`] widget wraps
+//! `PortalList`, the engine's [`Engine::viewport`] populates it each
+//! time state changes, and a `NextFrame` event drains the live-tail
+//! channel so newly appended rows appear without a manual refresh.
+//!
+//! Layer 2 (keyboard interaction): selection cursor (`j`/`k`/`↑`/`↓`,
+//! `PgUp`/`PgDn`/`Home`/`End`), bookmark toggle (`b`), search nav
+//! (`n`/`N`), saved-filter cycling (`s`), level hotkeys (`0`-`6`),
+//! follow toggle (`f`), stack folding (`z`). The filter/search text
+//! inputs and the JSON detail panel still live in queued follow-ups.
 
 use anyhow::Result;
 use clap::Parser;
@@ -166,11 +169,30 @@ struct AppState {
     runtime: Option<Runtime>,
     live_tail: Option<LiveTail>,
     last_error: Option<String>,
+    status_message: Option<String>,
     /// Always-on poll timer. `NextFrame` events fire once per frame and
     /// give us a place to drain the tailer channel without bringing tokio
     /// into Makepad's event loop.
     next_frame: Option<NextFrame>,
     follow: bool,
+    /// Row currently under the selection cursor. Anchors bookmark
+    /// toggles, search-result jumps, and the JSON detail panel. Mirrors
+    /// the iced/gpui semantics.
+    selected_row_id: Option<RowId>,
+    /// Active level filter (composes with `filter_text`). Set by the
+    /// 0-6 hotkeys; persisted as a session filter via `apply_filters`.
+    level: Option<LevelArg>,
+    /// Free-text filter as last submitted. Currently only mutated by
+    /// the initial CLI flag and the saved-filter cycle; will become
+    /// editable when the filter text input lands in the next commit.
+    filter_text: String,
+    /// Position in `engine.session().saved_filters` for the `s`-cycle.
+    /// `None` means "no saved filter active".
+    saved_filter_index: Option<usize>,
+    /// Stack-trace folding toggle (`z` key). When `true`, continuation
+    /// lines of a stack trace are hidden behind a folded badge on the
+    /// header row.
+    fold_stacks: bool,
 }
 
 impl LiveRegister for App {
@@ -251,23 +273,167 @@ impl App {
         self.state.session_path = args.session;
         self.state.runtime = Some(runtime);
         self.state.live_tail = live_tail;
+        self.state.level = args.level;
+        self.state.filter_text = args.filter.unwrap_or_default();
         if !load_errors.is_empty() {
             self.state.last_error = Some(load_errors.join("; "));
         }
         Ok(())
     }
 
+    /// Re-compose and re-apply the active filter set. Called when the
+    /// 0-6 hotkeys mutate the level filter and when the saved-filter
+    /// cycle returns to None. Failures go to `last_error` rather than
+    /// the status line so the user keeps a record until the next
+    /// successful apply.
+    fn reapply_filters(&mut self) {
+        let Some(engine) = self.state.engine.as_mut() else {
+            return;
+        };
+        let filter_text = if self.state.filter_text.is_empty() {
+            None
+        } else {
+            Some(self.state.filter_text.clone())
+        };
+        match apply_filters(engine, filter_text, self.state.level, None, None) {
+            Ok(_) => self.state.last_error = None,
+            Err(err) => self.state.last_error = Some(err.to_string()),
+        }
+    }
+
+    /// Move the selection cursor by `delta` rows in the filtered set.
+    /// Disables follow mode (the user is now driving navigation) and
+    /// returns the new position so the caller can scroll the list.
+    fn move_selection(&mut self, delta: isize) -> Option<usize> {
+        let engine = self.state.engine.as_mut()?;
+        let total = engine.matching_rows_count();
+        if total == 0 {
+            return None;
+        }
+        let current = self
+            .state
+            .selected_row_id
+            .and_then(|id| engine.filtered_position_for_row(id))
+            .unwrap_or(0);
+        let max = total.saturating_sub(1) as isize;
+        let next = (current as isize + delta).clamp(0, max) as usize;
+        let row = engine.present_row_at(next)?;
+        self.state.selected_row_id = Some(row.row_id);
+        self.state.follow = false;
+        Some(next)
+    }
+
+    /// `n` / `N` — jump the cursor to the next or previous search match.
+    /// No-ops gracefully when the search needle is empty.
+    fn jump_search(&mut self, reverse: bool) {
+        let engine = match self.state.engine.as_mut() {
+            Some(engine) => engine,
+            None => return,
+        };
+        match engine.next_search_result(self.state.selected_row_id, reverse) {
+            Some(next) => {
+                self.state.selected_row_id = Some(next);
+                self.state.follow = false;
+                self.state.status_message = None;
+            }
+            None => {
+                self.state.status_message = Some("no search matches".into());
+            }
+        }
+    }
+
+    /// `s` — cycle through saved filters loaded from `--session`.
+    /// Mirrors the order used by `glowtail-iced` and `glowtail-gpui`.
+    fn cycle_saved_filter(&mut self) {
+        let Some(engine) = self.state.engine.as_mut() else {
+            return;
+        };
+        let count = engine.session().saved_filters.len();
+        if count == 0 {
+            self.state.status_message = Some("no saved filters in session".into());
+            return;
+        }
+        let next_index = match self.state.saved_filter_index {
+            None => Some(0),
+            Some(i) if i + 1 < count => Some(i + 1),
+            Some(_) => None,
+        };
+        self.state.saved_filter_index = next_index;
+        match next_index {
+            Some(index) => {
+                let name = engine.session().saved_filters[index].name.clone();
+                match engine.apply_saved_filter(&name) {
+                    Ok(true) => {
+                        self.state.last_error = None;
+                        self.state.status_message = Some(format!("saved filter: {name}"));
+                    }
+                    Ok(false) | Err(_) => {
+                        self.state.last_error = Some(format!("could not load saved filter {name}"));
+                    }
+                }
+            }
+            None => {
+                self.reapply_filters();
+                self.state.status_message = Some("saved filter: (none)".into());
+            }
+        }
+    }
+
+    /// `b` — toggle bookmark on the currently selected row. Persisted
+    /// to the session via [`Drop`] when `--session` is supplied.
+    fn toggle_bookmark_for_selection(&mut self) {
+        let Some(row_id) = self.state.selected_row_id else {
+            self.state.status_message =
+                Some("select a row first (j/k or ↑/↓) before bookmarking".into());
+            return;
+        };
+        if let Some(engine) = self.state.engine.as_mut() {
+            engine.toggle_bookmark(row_id, None);
+        }
+    }
+
+    /// `z` — toggle the engine's stack-trace folding so continuation
+    /// lines of a Java/Rust stack trace collapse under the header row.
+    fn toggle_stack_folding(&mut self) {
+        self.state.fold_stacks = !self.state.fold_stacks;
+        if let Some(engine) = self.state.engine.as_mut() {
+            engine.set_stack_trace_folding(self.state.fold_stacks);
+        }
+    }
+
     fn refresh_status(&mut self, cx: &mut Cx) {
         let status_text = if let Some(engine) = self.state.engine.as_mut() {
             let snapshot = engine.metadata_snapshot();
+            let level = level_label(self.state.level);
+            let saved = match self.state.saved_filter_index {
+                Some(index) => {
+                    let name = engine.session().saved_filters[index].name.clone();
+                    format!(" • saved: {name}")
+                }
+                None => String::new(),
+            };
+            let msg = self
+                .state
+                .status_message
+                .as_deref()
+                .map(|m| format!(" • {m}"))
+                .unwrap_or_default();
             format!(
-                "rows: {} • matching: {} • warn: {} • error: {} • sources: {}{}",
+                "rows: {} • matching: {} • warn: {} • error: {} • sources: {} • level: {}{}{}{}{}",
                 snapshot.total_rows,
                 snapshot.total_matching_rows,
                 snapshot.level_counts.warn,
                 snapshot.level_counts.error + snapshot.level_counts.fatal,
                 snapshot.source_summaries.len(),
+                level,
+                saved,
                 if self.state.follow { " • follow" } else { "" },
+                if self.state.fold_stacks {
+                    " • fold"
+                } else {
+                    ""
+                },
+                msg,
             )
         } else {
             String::from("engine not initialised")
@@ -310,8 +476,8 @@ impl App {
 
     /// Snapshot the current viewport rows into the [`LogList`] so its
     /// next `draw_walk` can render them. Called when the engine state
-    /// changes (live append, filter change) — *not* every frame, so the
-    /// vector copy is bounded by actual UI mutations.
+    /// changes (live append, filter change, selection move) — *not*
+    /// every frame, so the vector copy is bounded by actual UI mutations.
     fn push_rows_to_list(&mut self, cx: &mut Cx) {
         let Some(engine) = self.state.engine.as_mut() else {
             return;
@@ -320,9 +486,21 @@ impl App {
             first_row: 0,
             row_count: PAGE_SIZE,
         });
-        self.ui
-            .log_list(id!(log_list))
-            .set_rows(cx, snapshot.rows, self.state.follow);
+        // Pull selection position now so the LogList can scroll to keep
+        // the cursor on-screen during navigation. `None` means
+        // "selection currently invisible" (e.g. filtered out) — the list
+        // won't scroll in that case.
+        let selection_position = self
+            .state
+            .selected_row_id
+            .and_then(|id| engine.filtered_position_for_row(id));
+        self.ui.log_list(id!(log_list)).set_state(
+            cx,
+            snapshot.rows,
+            self.state.follow,
+            self.state.selected_row_id,
+            selection_position,
+        );
     }
 }
 
@@ -355,8 +533,90 @@ impl AppMain for App {
         if let Event::Startup = event {
             self.push_rows_to_list(cx);
         }
+
+        // Keyboard shortcuts. Until the filter/search text inputs land
+        // we don't need mode gating — every KeyDown is interpreted as a
+        // Normal-mode shortcut. The mode machine arrives with the text
+        // input commit (task #9).
+        if let Event::KeyDown(key) = event {
+            self.handle_key_down(cx, key);
+        }
     }
 }
+
+impl App {
+    fn handle_key_down(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        let mut state_changed = true;
+        match key.key_code {
+            KeyCode::ArrowUp | KeyCode::KeyK => {
+                self.move_selection(-1);
+            }
+            KeyCode::ArrowDown | KeyCode::KeyJ => {
+                self.move_selection(1);
+            }
+            KeyCode::PageUp => {
+                self.move_selection(-(PAGE_STEP as isize));
+            }
+            KeyCode::PageDown => {
+                self.move_selection(PAGE_STEP as isize);
+            }
+            KeyCode::Home => {
+                self.move_selection(isize::MIN / 2);
+                self.state.follow = false;
+            }
+            KeyCode::End => {
+                self.move_selection(isize::MAX / 2);
+                self.state.follow = true;
+            }
+            KeyCode::KeyF => {
+                self.state.follow = !self.state.follow;
+            }
+            KeyCode::KeyB => self.toggle_bookmark_for_selection(),
+            KeyCode::KeyN if key.modifiers.shift => self.jump_search(true),
+            KeyCode::KeyN => self.jump_search(false),
+            KeyCode::KeyS => self.cycle_saved_filter(),
+            KeyCode::KeyZ => self.toggle_stack_folding(),
+            KeyCode::Key0 => {
+                self.state.level = None;
+                self.reapply_filters();
+            }
+            KeyCode::Key1 => {
+                self.state.level = Some(LevelArg::Trace);
+                self.reapply_filters();
+            }
+            KeyCode::Key2 => {
+                self.state.level = Some(LevelArg::Debug);
+                self.reapply_filters();
+            }
+            KeyCode::Key3 => {
+                self.state.level = Some(LevelArg::Info);
+                self.reapply_filters();
+            }
+            KeyCode::Key4 => {
+                self.state.level = Some(LevelArg::Warn);
+                self.reapply_filters();
+            }
+            KeyCode::Key5 => {
+                self.state.level = Some(LevelArg::Error);
+                self.reapply_filters();
+            }
+            KeyCode::Key6 => {
+                self.state.level = Some(LevelArg::Fatal);
+                self.reapply_filters();
+            }
+            _ => state_changed = false,
+        }
+        if state_changed {
+            self.push_rows_to_list(cx);
+            self.refresh_status(cx);
+        }
+    }
+}
+
+/// Number of rows skipped per PgUp/PgDn keypress. Roughly half the
+/// realistic visible viewport so a page move leaves some context above
+/// and below the new cursor position.
+const PAGE_STEP: usize = 24;
 
 impl Drop for App {
     fn drop(&mut self) {
@@ -382,6 +642,13 @@ pub struct LogList {
     rows: Vec<RowPresentation>,
     #[rust]
     follow: bool,
+    #[rust]
+    selected_row_id: Option<RowId>,
+    /// Position of the selected row in the filtered set, used to
+    /// nudge the `PortalList` so the cursor stays on-screen during
+    /// keyboard navigation.
+    #[rust]
+    selection_position: Option<usize>,
 }
 
 impl Widget for LogList {
@@ -391,21 +658,52 @@ impl Widget for LogList {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
-            // `set_tail_range` is on `PortalListRef`, not the inner widget,
-            // so call it before borrowing the inner for the populate loop.
+            // `set_tail_range`/`set_first_id_and_scroll` are on
+            // `PortalListRef`, not the inner widget, so call them before
+            // borrowing the inner for the populate loop.
             let portal_list = step.as_portal_list();
             portal_list.set_tail_range(self.follow);
+            if let Some(position) = self.selection_position {
+                // Anchor the visible window a few rows above the
+                // selection so the cursor isn't pinned to the very top
+                // edge after a navigation step.
+                let anchor = position.saturating_sub(4);
+                portal_list.set_first_id(anchor);
+            }
             if let Some(mut list) = portal_list.borrow_mut() {
                 let count = self.rows.len();
                 list.set_item_range(cx, 0, count);
                 while let Some(item_id) = list.next_visible_item(cx) {
                     if let Some(row) = self.rows.get(item_id) {
+                        let is_selected = self.selected_row_id == Some(row.row_id);
                         let item = list.item(cx, item_id, live_id!(LogRow));
                         let text = row_text(row);
-                        let colour = severity_vec(row.severity_role());
+                        let text_colour = severity_vec(row.severity_role());
+                        let bg_colour = if is_selected {
+                            Vec4 {
+                                x: 0x22 as f32 / 255.0,
+                                y: 0x55 as f32 / 255.0,
+                                z: 0x88 as f32 / 255.0,
+                                w: 0.6,
+                            }
+                        } else {
+                            Vec4 {
+                                x: 0.0,
+                                y: 0.0,
+                                z: 0.0,
+                                w: 0.0,
+                            }
+                        };
+                        item.apply_over(
+                            cx,
+                            live! {
+                                show_bg: true,
+                                draw_bg: { color: (bg_colour) },
+                            },
+                        );
                         let label = item.label(id!(row_label));
                         label.set_text(cx, &text);
-                        label.apply_over(cx, live! { draw_text: { color: (colour) } });
+                        label.apply_over(cx, live! { draw_text: { color: (text_colour) } });
                         item.draw_all(cx, &mut Scope::empty());
                     }
                 }
@@ -416,13 +714,24 @@ impl Widget for LogList {
 }
 
 impl LogListRef {
-    /// Push a new viewport snapshot into the list. The widget redraws on
-    /// the next frame; cheap when called with `follow=true` because
-    /// [`PortalList::set_first_id`] just shifts the cursor to the tail.
-    fn set_rows(&mut self, cx: &mut Cx, rows: Vec<RowPresentation>, follow: bool) {
+    /// Push a new viewport snapshot into the list along with the
+    /// selection cursor it should highlight and scroll to. Cheap to
+    /// call after every state mutation — the widget just stores the
+    /// values and requests a redraw, the actual work happens in
+    /// [`LogList::draw_walk`].
+    fn set_state(
+        &self,
+        cx: &mut Cx,
+        rows: Vec<RowPresentation>,
+        follow: bool,
+        selected_row_id: Option<RowId>,
+        selection_position: Option<usize>,
+    ) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.rows = rows;
             inner.follow = follow;
+            inner.selected_row_id = selected_row_id;
+            inner.selection_position = selection_position;
             inner.redraw(cx);
         }
     }
@@ -447,6 +756,18 @@ fn row_text(row: &RowPresentation) -> String {
         out.push_str(" ★");
     }
     out
+}
+
+fn level_label(level: Option<LevelArg>) -> &'static str {
+    match level {
+        None => "all",
+        Some(LevelArg::Trace) => "trace",
+        Some(LevelArg::Debug) => "debug",
+        Some(LevelArg::Info) => "info",
+        Some(LevelArg::Warn) => "warn",
+        Some(LevelArg::Error) => "error",
+        Some(LevelArg::Fatal) => "fatal",
+    }
 }
 
 /// Severity → makepad colour, as the four-component vec4 the
