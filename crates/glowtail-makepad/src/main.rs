@@ -10,8 +10,16 @@
 //! Layer 2 (keyboard interaction): selection cursor (`j`/`k`/`↑`/`↓`,
 //! `PgUp`/`PgDn`/`Home`/`End`), bookmark toggle (`b`), search nav
 //! (`n`/`N`), saved-filter cycling (`s`), level hotkeys (`0`-`6`),
-//! follow toggle (`f`), stack folding (`z`). The filter/search text
-//! inputs and the JSON detail panel still live in queued follow-ups.
+//! follow toggle (`f`), stack folding (`z`), filter text input (`/`)
+//! and search text input (`?`) with the same Normal/Filter/Search
+//! `InputMode` gating that `glowtail-iced` uses.
+//!
+//! Layer 3 (chrome): JSON detail panel for the selected row, search-
+//! match row highlighting. Per-span colouring inside a row remains a
+//! known gap — Makepad's retained-widget model doesn't lend itself to
+//! the per-`StyledSpan` `<div>` per row the other front-ends use, so
+//! the whole row is currently tinted by severity. A source sidebar and
+//! command palette also stay queued.
 
 use anyhow::Result;
 use clap::Parser;
@@ -143,6 +151,30 @@ live_design! {
                     }
 
                     log_list = <LogList> {}
+
+                    detail_panel = <View> {
+                        width: Fill, height: Fit,
+                        padding: { top: 8, bottom: 8, left: 8, right: 8 },
+                        flow: Down,
+                        spacing: 4,
+                        show_bg: true,
+                        draw_bg: { color: #1a1a1a },
+                        detail_title = <Label> {
+                            text: "",
+                            draw_text: {
+                                text_style: { font_size: 11.0 },
+                                color: #c8a2c8,
+                            }
+                        }
+                        detail_body = <Label> {
+                            width: Fill,
+                            text: "",
+                            draw_text: {
+                                text_style: { font_size: 11.0 },
+                                color: #fbbc04,
+                            }
+                        }
+                    }
 
                     footer = <View> {
                         width: Fill, height: Fit,
@@ -564,6 +596,15 @@ impl App {
             .state
             .selected_row_id
             .and_then(|id| engine.filtered_position_for_row(id));
+        // Capture the selected row's JSON fields (if any) before passing
+        // ownership of `snapshot.rows` into the list widget. Avoids a
+        // second `present_row_at` lookup.
+        let detail_fields = self
+            .state
+            .selected_row_id
+            .and_then(|id| snapshot.rows.iter().find(|row| row.row_id == id))
+            .map(|row| row.json_fields())
+            .unwrap_or_default();
         self.ui.log_list(id!(log_list)).set_state(
             cx,
             snapshot.rows,
@@ -571,6 +612,29 @@ impl App {
             self.state.selected_row_id,
             selection_position,
         );
+        self.refresh_detail_panel(cx, &detail_fields);
+    }
+
+    /// Render the JSON detail panel for the currently selected row.
+    /// Hidden (empty text + `visible: false`) when there's no selection
+    /// or no JSON fields on the selected row, so the layout doesn't
+    /// shift around as the cursor moves through plain-text rows.
+    fn refresh_detail_panel(&mut self, cx: &mut Cx, fields: &[(Arc<str>, Arc<str>)]) {
+        let panel = self.ui.view(id!(detail_panel));
+        if fields.is_empty() {
+            panel.apply_over(cx, live! { visible: false });
+            self.ui.label(id!(detail_title)).set_text(cx, "");
+            self.ui.label(id!(detail_body)).set_text(cx, "");
+            return;
+        }
+        panel.apply_over(cx, live! { visible: true });
+        self.ui.label(id!(detail_title)).set_text(cx, "JSON detail");
+        let body = fields
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.ui.label(id!(detail_body)).set_text(cx, &body);
     }
 }
 
@@ -784,12 +848,32 @@ impl Widget for LogList {
                         let item = list.item(cx, item_id, live_id!(LogRow));
                         let text = row_text(row);
                         let text_colour = severity_vec(row.severity_role());
+                        // Selection wins over match wins over bookmark in
+                        // terms of background. Matches use a translucent
+                        // yellow so the search hit stands out even when
+                        // it's many rows offscreen; without per-span
+                        // colour this is the only way to surface where
+                        // the search needle lives.
                         let bg_colour = if is_selected {
                             Vec4 {
                                 x: 0x22 as f32 / 255.0,
                                 y: 0x55 as f32 / 255.0,
                                 z: 0x88 as f32 / 255.0,
                                 w: 0.6,
+                            }
+                        } else if row.is_match {
+                            Vec4 {
+                                x: 0xc9 as f32 / 255.0,
+                                y: 0xd9 as f32 / 255.0,
+                                z: 0x6f as f32 / 255.0,
+                                w: 0.25,
+                            }
+                        } else if row.is_bookmarked {
+                            Vec4 {
+                                x: 0xff as f32 / 255.0,
+                                y: 0xc8 as f32 / 255.0,
+                                z: 0x6b as f32 / 255.0,
+                                w: 0.15,
                             }
                         } else {
                             Vec4 {
