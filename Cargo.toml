@@ -25,6 +25,10 @@ eframe = { version = "0.28", features = ["wgpu"] }
 gpui = "0.2.2"
 iced = { version = "0.13", features = ["tokio"] }
 makepad-widgets = "1.0"
+# `macos_kqueue` swaps the macOS backend from FSEvents (which coalesces
+# events for ~100ms+) to kqueue, which fires immediately — the tailer's
+# first-byte latency depends on it. Linux uses inotify either way.
+notify = { version = "8", features = ["macos_kqueue"] }
 ratatui = "0.28"
 regex = "1"
 serde = { version = "1", features = ["derive", "rc"] }

@@ -40,6 +40,21 @@ pub struct Engine {
     /// everything", which is the default and correct for investigations.
     /// Live-tail use cases (`tail -f`-style) set this to bound memory.
     max_rows: Option<usize>,
+    /// `search_text` pre-lowercased once at set time, so per-row matching
+    /// never re-lowercases the needle.
+    search_text_lower: Option<String>,
+    /// Cached aggregate statistics over the current filtered set. Counter
+    /// aggregates update in place on append; the timeline portion rebuilds
+    /// lazily because a new min/max timestamp moves every bucket boundary.
+    /// `None` after any change that could alter which rows pass the filter.
+    aggregates: Option<AggregateCache>,
+}
+
+#[derive(Debug)]
+struct AggregateCache {
+    level_counts: LevelCounts,
+    source_summaries: BTreeMap<SourceId, SourceSummary>,
+    timeline: Option<(Vec<TimelineBucket>, TimelineAnalytics)>,
 }
 
 impl Engine {
@@ -71,7 +86,7 @@ impl Engine {
             });
         self.index.append(row);
         self.try_incremental_cache_update();
-        self.enforce_max_rows();
+        self.enforce_max_rows(true);
     }
 
     /// Set or clear the opt-in cap on retained rows. When `max` is `Some(n)`
@@ -81,7 +96,7 @@ impl Engine {
     /// session file — it's a runtime setting chosen per UI launch.
     pub fn set_max_rows(&mut self, max: Option<usize>) {
         self.max_rows = max;
-        self.enforce_max_rows();
+        self.enforce_max_rows(false);
     }
 
     pub fn max_rows(&self) -> Option<usize> {
@@ -95,7 +110,7 @@ impl Engine {
         self.index.evicted_count()
     }
 
-    fn enforce_max_rows(&mut self) {
+    fn enforce_max_rows(&mut self, slack: bool) {
         let Some(max) = self.max_rows else {
             return;
         };
@@ -103,7 +118,12 @@ impl Engine {
         if total <= max {
             return;
         }
-        let evict = total - max;
+        // Evicting one row per append at the cap would memmove the whole Vec
+        // every time. The append path (`slack`) evicts down to max - max/10
+        // in one batch so the amortised per-append cost stays O(1); explicit
+        // reconfiguration via `set_max_rows` evicts exactly to the cap.
+        let target = if slack { max - max / 10 } else { max };
+        let evict = total - target;
         let evicted = self.index.evict_oldest(evict);
         if evicted == 0 {
             return;
@@ -123,6 +143,9 @@ impl Engine {
             let index = &self.index;
             cache.retain(|&id| index.position_of(id).is_some());
         }
+        // Aggregates would need per-row decrements to track eviction; with
+        // batched eviction a lazy rebuild is cheaper and simpler.
+        self.aggregates = None;
     }
 
     /// Update `filtered_positions` and `search_cache` for the row that was
@@ -152,6 +175,29 @@ impl Engine {
         let new_ts = new_row.timestamp;
         let new_id = new_row.row_id;
 
+        // Counter aggregates update in place; the timeline depends on the
+        // bucketing of the whole time range, so it rebuilds lazily on the
+        // next aggregate read instead.
+        if let Some(aggregates) = self.aggregates.as_mut() {
+            aggregates.level_counts.record(new_row.level);
+            let summary = aggregates
+                .source_summaries
+                .entry(new_row.source_id)
+                .or_insert_with(|| SourceSummary {
+                    source_id: new_row.source_id,
+                    name: self
+                        .sources
+                        .get(&new_row.source_id)
+                        .map(|source| source.name.clone())
+                        .unwrap_or_else(|| Arc::from(format!("source-{}", new_row.source_id.0))),
+                    rows: 0,
+                    level_counts: LevelCounts::default(),
+                });
+            summary.rows += 1;
+            summary.level_counts.record(new_row.level);
+            aggregates.timeline = None;
+        }
+
         if let Some(positions) = self.filtered_positions.as_mut() {
             let needs_insort = positions
                 .last()
@@ -177,42 +223,40 @@ impl Engine {
         // Only update if the search is active and the new row contains the
         // (already lowercased) needle.
         if self.search_cache.is_some()
-            && let Some(search) = self.search_text.as_ref()
+            && let Some(needle) = self.search_text_lower.as_ref()
+            && contains_ascii_ci(new_row.raw.as_ref(), needle)
         {
-            let needle = search.to_ascii_lowercase();
-            if contains_ascii_ci(new_row.raw.as_ref(), &needle) {
-                // Look up sort positions through the index so we can insort
-                // by the same (timestamp, row_id) key. Resolve each probe's
-                // sort key once via `position_of` to keep the borrow scoped.
-                let index = &self.index;
-                if let Some(cache) = self.search_cache.as_mut() {
-                    let needs_insort = cache
-                        .last()
-                        .and_then(|&last_id| {
-                            index
-                                .position_of(last_id)
-                                .map(|pos| (raw[pos].timestamp, raw[pos].row_id))
-                        })
-                        .map(|key| key > (new_ts, new_id))
-                        .unwrap_or(false);
-                    if needs_insort {
-                        let insert_at = cache
-                            .binary_search_by(|&probe| {
-                                match index.position_of(probe) {
-                                    Some(pos) => {
-                                        (raw[pos].timestamp, raw[pos].row_id).cmp(&(new_ts, new_id))
-                                    }
-                                    // Stale RowId (evicted row, if retention
-                                    // is bounded): treat as "less" so it
-                                    // remains at the front of the cache.
-                                    None => std::cmp::Ordering::Less,
+            // Look up sort positions through the index so we can insort
+            // by the same (timestamp, row_id) key. Resolve each probe's
+            // sort key once via `position_of` to keep the borrow scoped.
+            let index = &self.index;
+            if let Some(cache) = self.search_cache.as_mut() {
+                let needs_insort = cache
+                    .last()
+                    .and_then(|&last_id| {
+                        index
+                            .position_of(last_id)
+                            .map(|pos| (raw[pos].timestamp, raw[pos].row_id))
+                    })
+                    .map(|key| key > (new_ts, new_id))
+                    .unwrap_or(false);
+                if needs_insort {
+                    let insert_at = cache
+                        .binary_search_by(|&probe| {
+                            match index.position_of(probe) {
+                                Some(pos) => {
+                                    (raw[pos].timestamp, raw[pos].row_id).cmp(&(new_ts, new_id))
                                 }
-                            })
-                            .unwrap_or_else(|e| e);
-                        cache.insert(insert_at, new_id);
-                    } else {
-                        cache.push(new_id);
-                    }
+                                // Stale RowId (evicted row, if retention
+                                // is bounded): treat as "less" so it
+                                // remains at the front of the cache.
+                                None => std::cmp::Ordering::Less,
+                            }
+                        })
+                        .unwrap_or_else(|e| e);
+                    cache.insert(insert_at, new_id);
+                } else {
+                    cache.push(new_id);
                 }
             }
         }
@@ -235,6 +279,7 @@ impl Engine {
     pub fn set_search_text(&mut self, search_text: Option<String>) {
         let normalised = search_text.filter(|text| !text.is_empty());
         if normalised != self.search_text {
+            self.search_text_lower = normalised.as_ref().map(|text| text.to_ascii_lowercase());
             self.search_text = normalised;
             self.search_cache = None;
         }
@@ -290,11 +335,12 @@ impl Engine {
     }
 
     pub fn viewport(&mut self, request: ViewportRequest) -> ViewportSnapshot {
-        self.ensure_cache();
+        let (level_counts, source_summaries, timeline, timeline_analytics) =
+            self.aggregates_snapshot();
         let positions = self
             .filtered_positions
             .as_ref()
-            .expect("cache populated by ensure_cache");
+            .expect("cache populated by aggregates_snapshot");
         let total = positions.len();
         let start = request.first_row.min(total);
         let end = (start + request.row_count).min(total);
@@ -303,9 +349,6 @@ impl Engine {
             .iter()
             .map(|position| self.present_row(&raw_rows[*position]))
             .collect();
-
-        let (level_counts, source_summaries, timeline, timeline_analytics) =
-            self.aggregate_for_positions(positions);
 
         ViewportSnapshot {
             rows,
@@ -341,14 +384,13 @@ impl Engine {
     /// rows. Use this for sidebar/timeline UI elements that need the
     /// aggregates but never read `rows`.
     pub fn metadata_snapshot(&mut self) -> ViewportSnapshot {
-        self.ensure_cache();
-        let positions = self
+        let (level_counts, source_summaries, timeline, timeline_analytics) =
+            self.aggregates_snapshot();
+        let total = self
             .filtered_positions
             .as_ref()
-            .expect("cache populated by ensure_cache");
-        let total = positions.len();
-        let (level_counts, source_summaries, timeline, timeline_analytics) =
-            self.aggregate_for_positions(positions);
+            .expect("cache populated by aggregates_snapshot")
+            .len();
 
         ViewportSnapshot {
             rows: Vec::new(),
@@ -392,17 +434,25 @@ impl Engine {
 
     fn invalidate_cache(&mut self) {
         self.filtered_positions = None;
-        // Search results depend on the filtered set, so any change that
-        // touches the filter cache also invalidates the search cache.
+        // Search results and aggregates depend on the filtered set, so any
+        // change that touches the filter cache invalidates them too.
         self.search_cache = None;
+        self.aggregates = None;
     }
 
     pub fn filtered_position_for_row(&mut self, row_id: RowId) -> Option<usize> {
         self.ensure_cache();
+        // `filtered_positions` is sorted by (timestamp, row_id), so resolve
+        // the target's sort key in O(1) and binary-search instead of
+        // scanning — `n`/`N` navigation calls this per keystroke.
+        let target = self.index.position_of(row_id)?;
         let raw = self.index.rows();
-        self.filtered_positions
-            .as_ref()
-            .and_then(|positions| positions.iter().position(|p| raw[*p].row_id == row_id))
+        let key = (raw[target].timestamp, row_id);
+        self.filtered_positions.as_ref().and_then(|positions| {
+            positions
+                .binary_search_by(|&p| (raw[p].timestamp, raw[p].row_id).cmp(&key))
+                .ok()
+        })
     }
 
     pub fn search_results(&mut self) -> Vec<RowId> {
@@ -444,11 +494,10 @@ impl Engine {
         if self.search_cache.is_some() {
             return;
         }
-        let Some(search) = self.search_text.as_ref() else {
+        let Some(needle) = self.search_text_lower.clone() else {
             self.search_cache = Some(Vec::new());
             return;
         };
-        let needle = search.to_ascii_lowercase();
         self.ensure_cache();
         let raw = self.index.rows();
         let results = self
@@ -492,7 +541,7 @@ impl Engine {
         let row_count = before + after + 1;
         let window: Vec<&LogRow> = self.index.iter_range(first_row, row_count);
         let rows = window.iter().map(|row| self.present_row(row)).collect();
-        let (timeline, timeline_analytics) = Self::timeline(&window, 24);
+        let (timeline, timeline_analytics) = Self::timeline(window.iter().copied(), 24);
 
         ViewportSnapshot {
             rows,
@@ -500,8 +549,8 @@ impl Engine {
             total_matching_rows: window.len(),
             has_more_before: first_row > 0,
             has_more_after: first_row + window.len() < self.total_rows(),
-            level_counts: Self::level_counts(&window),
-            source_summaries: self.source_summaries(&window),
+            level_counts: Self::level_counts(window.iter().copied()),
+            source_summaries: self.source_summaries(window.iter().copied()),
             timeline,
             timeline_analytics,
         }
@@ -551,27 +600,80 @@ impl Engine {
         SourceId(self.sources.keys().map(|id| id.0).max().unwrap_or(0) + 1)
     }
 
-    fn aggregate_for_positions(
-        &self,
-        positions: &[usize],
+    /// Aggregate statistics for the current filtered set, served from the
+    /// cache. Counter aggregates were updated incrementally on append; the
+    /// timeline portion is rebuilt here when dirty (a new min/max timestamp
+    /// moves every bucket boundary, so it cannot update in place).
+    fn aggregates_snapshot(
+        &mut self,
     ) -> (
         LevelCounts,
         Vec<SourceSummary>,
         Vec<TimelineBucket>,
         TimelineAnalytics,
     ) {
-        let raw = self.index.rows();
-        let rows: Vec<&LogRow> = positions.iter().map(|p| &raw[*p]).collect();
-        let (timeline, timeline_analytics) = Self::timeline(&rows, 24);
+        self.ensure_cache();
+        if self.aggregates.is_none() {
+            let raw = self.index.rows();
+            let positions = self
+                .filtered_positions
+                .as_ref()
+                .expect("cache populated by ensure_cache");
+            let mut level_counts = LevelCounts::default();
+            let mut source_summaries = BTreeMap::new();
+            for &position in positions {
+                let row = &raw[position];
+                level_counts.record(row.level);
+                let summary =
+                    source_summaries
+                        .entry(row.source_id)
+                        .or_insert_with(|| SourceSummary {
+                            source_id: row.source_id,
+                            name: self
+                                .sources
+                                .get(&row.source_id)
+                                .map(|source| source.name.clone())
+                                .unwrap_or_else(|| {
+                                    Arc::from(format!("source-{}", row.source_id.0))
+                                }),
+                            rows: 0,
+                            level_counts: LevelCounts::default(),
+                        });
+                summary.rows += 1;
+                summary.level_counts.record(row.level);
+            }
+            self.aggregates = Some(AggregateCache {
+                level_counts,
+                source_summaries,
+                timeline: None,
+            });
+        }
+        if self
+            .aggregates
+            .as_ref()
+            .is_some_and(|aggregates| aggregates.timeline.is_none())
+        {
+            let raw = self.index.rows();
+            let positions = self
+                .filtered_positions
+                .as_ref()
+                .expect("cache populated by ensure_cache");
+            let timeline = Self::timeline(positions.iter().map(|&p| &raw[p]), 24);
+            if let Some(aggregates) = self.aggregates.as_mut() {
+                aggregates.timeline = Some(timeline);
+            }
+        }
+        let aggregates = self.aggregates.as_ref().expect("built above");
+        let (timeline, timeline_analytics) = aggregates.timeline.clone().expect("rebuilt above");
         (
-            Self::level_counts(&rows),
-            self.source_summaries(&rows),
+            aggregates.level_counts.clone(),
+            aggregates.source_summaries.values().cloned().collect(),
             timeline,
             timeline_analytics,
         )
     }
 
-    fn level_counts(rows: &[&LogRow]) -> LevelCounts {
+    fn level_counts<'a>(rows: impl Iterator<Item = &'a LogRow>) -> LevelCounts {
         let mut counts = LevelCounts::default();
         for row in rows {
             counts.record(row.level);
@@ -579,7 +681,7 @@ impl Engine {
         counts
     }
 
-    fn source_summaries(&self, rows: &[&LogRow]) -> Vec<SourceSummary> {
+    fn source_summaries<'a>(&self, rows: impl Iterator<Item = &'a LogRow>) -> Vec<SourceSummary> {
         let mut summaries = BTreeMap::<SourceId, SourceSummary>::new();
         for row in rows {
             let summary = summaries.entry(row.source_id).or_insert_with(|| {
@@ -601,11 +703,16 @@ impl Engine {
         summaries.into_values().collect()
     }
 
-    fn timeline(rows: &[&LogRow], max_buckets: usize) -> (Vec<TimelineBucket>, TimelineAnalytics) {
+    fn timeline<'a>(
+        rows: impl Iterator<Item = &'a LogRow> + Clone,
+        max_buckets: usize,
+    ) -> (Vec<TimelineBucket>, TimelineAnalytics) {
         let mut first = None;
         let mut last = None;
         let mut timestamped_rows = 0usize;
-        for row in rows {
+        let mut total_rows = 0usize;
+        for row in rows.clone() {
+            total_rows += 1;
             if let Some(timestamp) = row.timestamp {
                 timestamped_rows += 1;
                 first = Some(first.map_or(timestamp, |f: chrono::DateTime<chrono::Utc>| {
@@ -620,7 +727,7 @@ impl Engine {
             return (
                 Vec::new(),
                 TimelineAnalytics {
-                    untimestamped_rows: rows.len(),
+                    untimestamped_rows: total_rows,
                     ..TimelineAnalytics::default()
                 },
             );
@@ -683,7 +790,7 @@ impl Engine {
 
         let mut analytics = TimelineAnalytics {
             timestamped_rows,
-            untimestamped_rows: rows.len().saturating_sub(timestamped_rows),
+            untimestamped_rows: total_rows.saturating_sub(timestamped_rows),
             first_timestamp: Some(first),
             last_timestamp: Some(last),
             ..TimelineAnalytics::default()
@@ -741,21 +848,29 @@ impl Engine {
         }
 
         let mut is_match = false;
-        if let Some(search) = self.search_text.as_ref() {
+        // The no-alloc `contains_ascii_ci` pre-check skips the per-row
+        // lowercase allocation for the common case of a non-matching row.
+        if let Some(search_lower) = self.search_text_lower.as_ref()
+            && contains_ascii_ci(row.message.as_ref(), search_lower)
+        {
             let lower_message = row.message.to_ascii_lowercase();
-            let search_lower = search.to_ascii_lowercase();
-            if let Some(start) = lower_message.find(&search_lower) {
+            // Highlight every occurrence, emitting the plain text between
+            // matches as Message spans.
+            let mut cursor = 0usize;
+            while !search_lower.is_empty() {
+                let Some(found) = lower_message[cursor..].find(search_lower.as_str()) else {
+                    break;
+                };
                 is_match = true;
                 // The lower-cased search is byte-aligned with the original
                 // message only for ASCII inputs. Snap any non-char-boundary
                 // edges back to a valid UTF-8 boundary so slicing is safe.
-                let end = start + search_lower.len();
-                let start = snap_char_boundary(&row.message, start);
-                let end = snap_char_boundary(&row.message, end);
-                if start > 0 {
+                let start = snap_char_boundary(&row.message, cursor + found);
+                let end = snap_char_boundary(&row.message, cursor + found + search_lower.len());
+                if start > cursor {
                     spans.push(StyledSpan {
                         kind: SpanKind::Message,
-                        text: Arc::from(&row.message[..start]),
+                        text: Arc::from(&row.message[cursor..start]),
                         byte_range: None,
                     });
                 }
@@ -764,13 +879,19 @@ impl Engine {
                     text: Arc::from(&row.message[start..end]),
                     byte_range: Some(start..end),
                 });
-                if end < row.message.len() {
-                    spans.push(StyledSpan {
-                        kind: SpanKind::Message,
-                        text: Arc::from(&row.message[end..]),
-                        byte_range: None,
-                    });
-                }
+                // Always advance so degenerate non-ASCII snaps can't loop.
+                cursor = if end > cursor {
+                    end
+                } else {
+                    snap_char_boundary(&row.message, cursor + 1)
+                };
+            }
+            if is_match && cursor < row.message.len() {
+                spans.push(StyledSpan {
+                    kind: SpanKind::Message,
+                    text: Arc::from(&row.message[cursor..]),
+                    byte_range: None,
+                });
             }
         }
 
@@ -841,16 +962,15 @@ impl Engine {
             return 0;
         }
 
-        let mut count = 0;
-        let mut index = row.row_id.0 as usize + 1;
-        while let Some(next) = self.index.find_by_row_number(index) {
-            if !Self::is_stack_trace_continuation(next) {
-                break;
-            }
-            count += 1;
-            index += 1;
-        }
-        count
+        // RowIds survive eviction but Vec positions shift, so resolve the
+        // row's current position before walking forward.
+        let Some(position) = self.index.position_of(row.row_id) else {
+            return 0;
+        };
+        self.index.rows()[position + 1..]
+            .iter()
+            .take_while(|next| Self::is_stack_trace_continuation(next))
+            .count()
     }
 
     fn is_stack_trace_continuation(row: &LogRow) -> bool {
@@ -980,6 +1100,51 @@ mod tests {
     }
 
     #[test]
+    fn folded_stack_rows_resolve_after_eviction() {
+        // RowIds survive eviction but Vec positions shift, so the fold count
+        // must be derived from the row's current position, not its id.
+        let mut engine = Engine::default();
+        for i in 0..5 {
+            engine.append_row(mk_row(i, &format!("line-{i}"), None));
+        }
+        engine.append_row(mk_row(5, "Exception: boom", None));
+        engine.append_row(mk_row(6, "  at Foo.bar(Foo.java:1)", None));
+        engine.append_row(mk_row(7, "  at Foo.baz(Foo.java:2)", None));
+
+        // Keep the last 5 rows: ids 0-2 are evicted.
+        engine.set_max_rows(Some(5));
+
+        let snapshot = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        let head = snapshot
+            .rows
+            .iter()
+            .find(|row| row.row_id.0 == 5)
+            .expect("exception row visible");
+        assert_eq!(head.folded_stack_rows, 2);
+    }
+
+    #[test]
+    fn search_highlights_every_occurrence_in_a_row() {
+        let mut engine = Engine::default();
+        engine.append_row(mk_row(0, "timeout db timeout retry", None));
+        engine.set_search_text(Some("timeout".into()));
+
+        let snapshot = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        let matches = snapshot.rows[0]
+            .spans
+            .iter()
+            .filter(|span| span.kind == SpanKind::SearchMatch)
+            .count();
+        assert_eq!(matches, 2, "both occurrences must be highlighted");
+    }
+
+    #[test]
     fn incremental_cache_handles_ordered_and_out_of_order_appends() {
         // Review perf P1: monotonic-timestamp tails should `push`; out-of-order
         // arrivals must insort to preserve the (timestamp, row_id) order that
@@ -1024,6 +1189,114 @@ mod tests {
         // Expected sort order by timestamp: "earlier" (row 2), then "first"
         // (row 0), then "second" (row 1).
         assert_eq!(ids, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn append_eviction_is_batched_with_slack() {
+        // Once the cap is hit, evicting one row per append would memmove the
+        // whole Vec every time. Exceeding the cap instead evicts down to
+        // max - max/10 in one batch, amortising the cost; the cap itself is
+        // never exceeded.
+        let mut engine = Engine::default();
+        engine.set_max_rows(Some(100));
+        for i in 0..101 {
+            engine.append_row(mk_row(i, &format!("r{i}"), None));
+        }
+        assert_eq!(engine.total_rows(), 90);
+        assert_eq!(engine.evicted_row_count(), 11);
+
+        // Direct reconfiguration stays exact — no slack.
+        engine.set_max_rows(Some(50));
+        assert_eq!(engine.total_rows(), 50);
+    }
+
+    #[test]
+    fn aggregates_track_incremental_appends() {
+        // The aggregate cache is updated in place on append; the result must
+        // be identical to a from-scratch recomputation.
+        let mut engine = Engine::default();
+        engine.append_row(mk_row_with_source_time(
+            0,
+            SourceId(1),
+            "2026-01-01T00:00:00Z",
+            "a",
+            Some(LogLevel::Info),
+        ));
+        // Build all caches, then append through the incremental path.
+        let _ = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        engine.append_row(mk_row_with_source_time(
+            1,
+            SourceId(2),
+            "2026-01-01T00:00:30Z",
+            "b",
+            Some(LogLevel::Warn),
+        ));
+        engine.append_row(mk_row_with_source_time(
+            2,
+            SourceId(1),
+            "2026-01-01T00:01:00Z",
+            "c",
+            Some(LogLevel::Error),
+        ));
+        let snap = engine.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+
+        let mut fresh = Engine::default();
+        fresh.append_row(mk_row_with_source_time(
+            0,
+            SourceId(1),
+            "2026-01-01T00:00:00Z",
+            "a",
+            Some(LogLevel::Info),
+        ));
+        fresh.append_row(mk_row_with_source_time(
+            1,
+            SourceId(2),
+            "2026-01-01T00:00:30Z",
+            "b",
+            Some(LogLevel::Warn),
+        ));
+        fresh.append_row(mk_row_with_source_time(
+            2,
+            SourceId(1),
+            "2026-01-01T00:01:00Z",
+            "c",
+            Some(LogLevel::Error),
+        ));
+        let expected = fresh.viewport(ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+
+        assert_eq!(snap.level_counts, expected.level_counts);
+        assert_eq!(snap.source_summaries, expected.source_summaries);
+        assert_eq!(snap.timeline, expected.timeline);
+        assert_eq!(snap.timeline_analytics, expected.timeline_analytics);
+    }
+
+    #[test]
+    fn filtered_position_for_row_resolves_after_eviction_and_filtering() {
+        let mut engine = Engine::default();
+        for i in 0..10 {
+            engine.append_row(mk_row(i, if i % 2 == 0 { "even" } else { "odd" }, None));
+        }
+        engine
+            .set_filter(FilterExpr::Contains("odd".into()))
+            .unwrap();
+        // Evict rows 0-3; surviving odd rows are 5, 7, 9.
+        engine.set_max_rows(Some(6));
+
+        assert_eq!(engine.filtered_position_for_row(RowId(5)), Some(0));
+        assert_eq!(engine.filtered_position_for_row(RowId(9)), Some(2));
+        // Present but filtered out.
+        assert_eq!(engine.filtered_position_for_row(RowId(4)), None);
+        // Evicted.
+        assert_eq!(engine.filtered_position_for_row(RowId(1)), None);
     }
 
     #[test]

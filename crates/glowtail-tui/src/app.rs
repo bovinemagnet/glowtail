@@ -88,12 +88,14 @@ pub fn run_tui_with_events(
                     }
                     KeyCode::Char('n') => jump_to_search(&mut engine, &snapshot, &mut state, false),
                     KeyCode::Char('N') => jump_to_search(&mut engine, &snapshot, &mut state, true),
-                    KeyCode::Char('/') => {
-                        state.input_mode = InputMode::Search;
+                    // `/` = filter, `?` = search, matching the desktop
+                    // front-ends. `F` stays as a legacy filter alias.
+                    KeyCode::Char('/') | KeyCode::Char('F') => {
+                        state.input_mode = InputMode::Filter;
                         state.input.clear();
                     }
-                    KeyCode::Char('F') => {
-                        state.input_mode = InputMode::Filter;
+                    KeyCode::Char('?') => {
+                        state.input_mode = InputMode::Search;
                         state.input.clear();
                     }
                     _ => {}
@@ -215,6 +217,11 @@ fn drain_events(engine: &mut Engine, events: &mut Option<mpsc::Receiver<LogEvent
     loop {
         match rx.try_recv() {
             Ok(LogEvent::RowAppended(row)) => engine.append_row(row),
+            Ok(LogEvent::RowsAppended(rows)) => {
+                for row in rows {
+                    engine.append_row(row);
+                }
+            }
             Ok(LogEvent::SourceAdded { source_id, path }) => {
                 engine.add_source(source_id, path.display().to_string());
             }

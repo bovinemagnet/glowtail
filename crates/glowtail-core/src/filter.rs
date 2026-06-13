@@ -709,15 +709,30 @@ fn timestamp_compare(operator: Token, value: String) -> Result<FilterExpr, Filte
             start: Some(timestamp),
             end: Some(timestamp),
         }))),
-        Token::Gte | Token::Gt => Ok(FilterExpr::TimestampBetween {
+        Token::Gte => Ok(FilterExpr::TimestampBetween {
             start: Some(timestamp),
             end: None,
         }),
-        Token::Lte | Token::Lt => Ok(FilterExpr::TimestampBetween {
+        // `TimestampBetween` bounds are inclusive, so strict comparisons
+        // nudge the boundary by one nanosecond (chrono's resolution).
+        Token::Gt => Ok(FilterExpr::TimestampBetween {
+            start: Some(timestamp + TimeDelta::nanoseconds(1)),
+            end: None,
+        }),
+        Token::Lte => Ok(FilterExpr::TimestampBetween {
             start: None,
             end: Some(timestamp),
         }),
-        _ => unreachable!("not an operator"),
+        Token::Lt => Ok(FilterExpr::TimestampBetween {
+            start: None,
+            end: Some(timestamp - TimeDelta::nanoseconds(1)),
+        }),
+        // Defence in depth, mirroring `level_compare`: a refactor that routes
+        // a non-operator token here should surface as a query error, not a
+        // process-killing panic.
+        other => Err(FilterError::InvalidQuery(format!(
+            "operator {other:?} not valid for timestamp comparison"
+        ))),
     }
 }
 
@@ -775,6 +790,42 @@ mod tests {
         let row = mk_row("Database Timeout", None, SourceId(1));
         let compiled = CompiledFilter::compile(&FilterExpr::Contains("timeout".into())).unwrap();
         assert!(compiled.matches(&row));
+    }
+
+    #[test]
+    fn timestamp_gt_excludes_the_boundary_instant() {
+        let mut row = mk_row("boundary", None, SourceId(1));
+        row.timestamp = Some("2026-05-21T09:00:00Z".parse().unwrap());
+
+        let gt = parse_filter_query(r#"timestamp > "2026-05-21T09:00:00Z""#).unwrap();
+        let gte = parse_filter_query(r#"timestamp >= "2026-05-21T09:00:00Z""#).unwrap();
+        let gt = CompiledFilter::compile(&gt).unwrap();
+        let gte = CompiledFilter::compile(&gte).unwrap();
+
+        assert!(!gt.matches(&row), "> must exclude the boundary instant");
+        assert!(gte.matches(&row), ">= must include the boundary instant");
+
+        let mut later = mk_row("later", None, SourceId(1));
+        later.timestamp = Some("2026-05-21T09:00:01Z".parse().unwrap());
+        assert!(gt.matches(&later));
+    }
+
+    #[test]
+    fn timestamp_lt_excludes_the_boundary_instant() {
+        let mut row = mk_row("boundary", None, SourceId(1));
+        row.timestamp = Some("2026-05-21T09:00:00Z".parse().unwrap());
+
+        let lt = parse_filter_query(r#"timestamp < "2026-05-21T09:00:00Z""#).unwrap();
+        let lte = parse_filter_query(r#"timestamp <= "2026-05-21T09:00:00Z""#).unwrap();
+        let lt = CompiledFilter::compile(&lt).unwrap();
+        let lte = CompiledFilter::compile(&lte).unwrap();
+
+        assert!(!lt.matches(&row), "< must exclude the boundary instant");
+        assert!(lte.matches(&row), "<= must include the boundary instant");
+
+        let mut earlier = mk_row("earlier", None, SourceId(1));
+        earlier.timestamp = Some("2026-05-21T08:59:59Z".parse().unwrap());
+        assert!(lt.matches(&earlier));
     }
 
     #[test]

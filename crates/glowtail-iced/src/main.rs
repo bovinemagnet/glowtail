@@ -316,6 +316,12 @@ impl GlowtailIced {
                     self.engine.append_row(row);
                     appended = true;
                 }
+                Ok(LogEvent::RowsAppended(rows)) => {
+                    for row in rows {
+                        self.engine.append_row(row);
+                    }
+                    appended = true;
+                }
                 Ok(LogEvent::SourceAdded { source_id, path }) => {
                     self.engine
                         .add_source(source_id, path.display().to_string());
@@ -774,10 +780,13 @@ impl GlowtailIced {
         };
         let follow_button = button(text(follow_label)).on_press(Message::FollowToggled);
 
-        let saved_label = match self.saved_filter_index {
-            Some(index) => format!("saved: {}", self.engine.session().saved_filters[index].name),
-            None => String::from("saved: (none)"),
-        };
+        // `.get` guards against a cycle cursor left stale by a shrunken
+        // saved-filter list; `view` takes `&self` so it cannot reset it.
+        let saved_label = self
+            .saved_filter_index
+            .and_then(|index| self.engine.session().saved_filters.get(index))
+            .map(|filter| format!("saved: {}", filter.name))
+            .unwrap_or_else(|| String::from("saved: (none)"));
         let saved_button = button(text(saved_label)).on_press(Message::SavedFilterCycled);
 
         let top_bar = row![
