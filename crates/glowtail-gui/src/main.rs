@@ -590,7 +590,6 @@ impl GlowtailGui {
             return;
         };
 
-        let mut changed = false;
         loop {
             match live_tail.receiver.try_recv() {
                 Ok(LogEvent::SourceAdded { source_id, path }) => {
@@ -599,7 +598,11 @@ impl GlowtailGui {
                 }
                 Ok(LogEvent::RowAppended(row)) => {
                     self.engine.append_row(row);
-                    changed = true;
+                }
+                Ok(LogEvent::RowsAppended(rows)) => {
+                    for row in rows {
+                        self.engine.append_row(row);
+                    }
                 }
                 Ok(LogEvent::SourceRotated { source_id }) => {
                     self.status_message = Some(format!("source {} rotated", source_id.0));
@@ -615,10 +618,6 @@ impl GlowtailGui {
                     break;
                 }
             }
-        }
-
-        if changed {
-            self.save_session();
         }
     }
 
@@ -650,6 +649,7 @@ impl GlowtailGui {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
             self.scroll_to_row = Some(scroll_target(first, 1, total));
+            self.follow = false;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)) {
             self.scroll_to_row = Some(scroll_target(first, -page, total));
@@ -657,6 +657,7 @@ impl GlowtailGui {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)) {
             self.scroll_to_row = Some(scroll_target(first, page, total));
+            self.follow = false;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home)) {
             self.scroll_to_row = Some(0);
@@ -860,22 +861,16 @@ fn paint_span(
     let color = span_color(span);
     let galley =
         painter.layout_no_wrap(span.text.to_string(), egui::FontId::monospace(13.0), color);
+    let size = galley.size();
     if span.kind == SpanKind::SearchMatch {
         painter.rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(x, rect.center().y - galley.size().y / 2.0),
-                galley.size(),
-            ),
+            egui::Rect::from_min_size(egui::pos2(x, rect.center().y - size.y / 2.0), size),
             2.0,
             egui::Color32::from_rgb(170, 220, 80),
         );
     }
-    painter.galley(
-        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
-        galley.clone(),
-        color,
-    );
-    x + galley.size().x
+    painter.galley(egui::pos2(x, rect.center().y - size.y / 2.0), galley, color);
+    x + size.x
 }
 
 fn span_color(span: &StyledSpan) -> egui::Color32 {

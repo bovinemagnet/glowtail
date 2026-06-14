@@ -559,6 +559,13 @@ impl GlowtailGpui {
                     self.engine.borrow_mut().append_row(row);
                     changed = true;
                 }
+                Ok(LogEvent::RowsAppended(rows)) => {
+                    let mut engine = self.engine.borrow_mut();
+                    for row in rows {
+                        engine.append_row(row);
+                    }
+                    changed = true;
+                }
                 Ok(LogEvent::SourceRotated { source_id }) => {
                     self.status_message = Some(format!("source {} rotated", source_id.0));
                 }

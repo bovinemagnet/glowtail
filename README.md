@@ -182,6 +182,8 @@ cargo run -p glowtail-gpui -- samples/mixed.log --from-start --level warn
 
 By default, commands follow files for appended lines. Add `--no-follow` for one-shot reads that exit after current content is processed.
 
+Tailing is notification-driven where the platform supports it (inotify on Linux, kqueue on macOS), with a 200 ms poll as the fallback, so appended lines surface in single-digit milliseconds. The tailer detects logrotate-style rename rotation by file identity (device + inode), not just length, holds partially written lines until their newline arrives, batches bursts into a single channel event, and replaces invalid UTF-8 rather than erroring the source.
+
 ```bash
 cargo run -p glowtail-cli -- tail samples/mixed.log --no-follow
 cargo run -p glowtail-cli -- view samples/mixed.log --from-start
@@ -193,9 +195,9 @@ cargo run -p glowtail-cli -- view samples/mixed.log --from-start
 - `j`/Down and `k`/Up: move the selection cursor (scrolls the viewport at the edges)
 - `g` and `G`: jump to top or bottom
 - `f`: toggle follow mode
-- `/`: enter search text
+- `/` (or `F`): enter a filter query
+- `?`: enter search text
 - `n`/`N`: jump to next or previous search result
-- `F`: enter a contains filter
 - `b`: bookmark the currently selected row
 - `z`: toggle stack-trace folding
 - `Esc`: leave input mode
@@ -296,15 +298,15 @@ cargo test -p glowtail-core --test large_viewport -- --ignored
 cargo test --release -p glowtail-core --test viewport_perf -- --ignored --nocapture
 ```
 
-Indicative numbers on the same Linux laptop, 100 000-row index:
+Indicative numbers on an Apple-silicon laptop, 100 000-row index:
 
 | Scenario | size 80 | size 1 024 | size 10 000 |
 |---|---|---|---|
-| no filter | ~1.4 ms | ~1.6 ms | ~4.3 ms |
-| `level >= warn` | ~230 µs | ~420 µs | ~2.6 ms |
-| `contains "timeout"` (warm) | ~1.4 ms | ~1.6 ms | ~3.6 ms |
+| no filter | ~10 µs | ~104 µs | ~937 µs |
+| `level >= warn` | ~7 µs | ~93 µs | ~916 µs |
+| `contains "timeout"` (warm) | ~6 µs | ~91 µs | ~873 µs |
 
-A no-filter "small viewport" call still costs ~1.4 ms because `ViewportSnapshot` carries metadata aggregates (`level_counts`, `source_summaries`, `timeline`) computed over the full filtered set, not just the requested window — the per-frame floor every UI inherits.
+The aggregate metadata in `ViewportSnapshot` (`level_counts`, `source_summaries`, `timeline`) is cached: counter aggregates update in place as rows append and the timeline rebuilds lazily when new rows arrive, so a steady-state viewport call scales with the requested window rather than the full filtered set. The cost is dominated by materialising the requested `RowPresentation`s.
 
 ### Per-UI translation seam benches
 

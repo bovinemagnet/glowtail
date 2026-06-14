@@ -124,13 +124,22 @@ impl InvestigationSession {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionIoError> {
         let json = std::fs::read_to_string(path)?;
-        let session: Self = serde_json::from_str(&json)?;
-        if session.version > SESSION_VERSION {
+        // Check the version before the strict deserialisation: a newer
+        // build's extra fields would otherwise trip `deny_unknown_fields`
+        // and mask the helpful UnsupportedVersion message.
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let file_version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .map(|version| u32::try_from(version).unwrap_or(u32::MAX))
+            .unwrap_or(SESSION_VERSION);
+        if file_version > SESSION_VERSION {
             return Err(SessionIoError::UnsupportedVersion {
-                file_version: session.version,
+                file_version,
                 supported: SESSION_VERSION,
             });
         }
+        let session: Self = serde_json::from_value(value)?;
         Ok(session)
     }
 }
@@ -184,6 +193,23 @@ mod tests {
                 .iter()
                 .any(|expr| matches!(expr, FilterExpr::Contains(s) if s == "term-0"))
         );
+    }
+
+    #[test]
+    fn newer_version_with_unknown_fields_reports_unsupported_version() {
+        // A newer build that added fields must still produce the helpful
+        // UnsupportedVersion error, not an opaque unknown-field JSON error.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            format!(
+                r#"{{"version":{},"filter_history":[],"saved_filters":[],"bookmarks":[],"new_field":true}}"#,
+                SESSION_VERSION + 1
+            ),
+        )
+        .unwrap();
+        let err = InvestigationSession::load_from_path(tmp.path()).unwrap_err();
+        assert!(matches!(err, SessionIoError::UnsupportedVersion { .. }));
     }
 
     #[test]

@@ -185,6 +185,16 @@ async fn run_tail_follow(options: TailRun) -> Result<()> {
                     println!("{raw}");
                 }
             }
+            LogEvent::RowsAppended(rows) => {
+                for row in rows {
+                    let should_print = compiled_filter.matches(&row);
+                    let raw = row.raw.clone();
+                    engine.append_row(row);
+                    if should_print {
+                        println!("{raw}");
+                    }
+                }
+            }
             LogEvent::SourceError { message, .. } => eprintln!("source error: {message}"),
             _ => {}
         }

@@ -233,6 +233,11 @@ async fn pipeline_bench(poll_ms: u64, rows_to_produce: u64) -> Duration {
         loop {
             match rx.try_recv() {
                 Ok(LogEvent::RowAppended(row)) => engine.append_row(row),
+                Ok(LogEvent::RowsAppended(rows)) => {
+                    for row in rows {
+                        engine.append_row(row);
+                    }
+                }
                 Ok(LogEvent::SourceAdded { source_id, path }) => {
                     engine.add_source(source_id, path.display().to_string());
                 }
@@ -414,6 +419,7 @@ fn viewport_steady_state_latency() {
 // system crate, and CI is Linux. Captures the per-row Arc overhead that PH2
 // and PL2 in the 2026-05-26 review address.
 
+#[cfg(target_os = "linux")]
 const MEMORY_FOOTPRINT_ROWS: u64 = 1_000_000;
 
 #[cfg(target_os = "linux")]
@@ -498,11 +504,13 @@ async fn source_first_byte_latency() {
         let t0 = Instant::now();
         writeln!(file, "first-byte test row {iter}").expect("write");
         file.flush().expect("flush");
-        // Wait until at least one `RowAppended` event arrives. Short sleeps
-        // keep the busy-loop bounded while the tailer's 200ms polling fires.
+        // Wait until at least one row event arrives. Short sleeps keep the
+        // busy-loop bounded while the tailer's FS notification (or its
+        // 200ms poll fallback) fires.
         loop {
             match rx.try_recv() {
                 Ok(LogEvent::RowAppended(_)) => break,
+                Ok(LogEvent::RowsAppended(rows)) if !rows.is_empty() => break,
                 Ok(_) => continue,
                 Err(mpsc::error::TryRecvError::Empty) => {
                     tokio::time::sleep(Duration::from_millis(1)).await;

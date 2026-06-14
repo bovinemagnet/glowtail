@@ -826,13 +826,14 @@ impl App {
         let status_text = if let Some(engine) = self.state.engine.as_mut() {
             let snapshot = engine.metadata_snapshot();
             let level = level_label(self.state.level);
-            let saved = match self.state.saved_filter_index {
-                Some(index) => {
-                    let name = engine.session().saved_filters[index].name.clone();
-                    format!(" • saved: {name}")
-                }
-                None => String::new(),
-            };
+            // `.get` guards against a cycle cursor left stale by a
+            // shrunken saved-filter list.
+            let saved = self
+                .state
+                .saved_filter_index
+                .and_then(|index| engine.session().saved_filters.get(index))
+                .map(|filter| format!(" • saved: {}", filter.name))
+                .unwrap_or_default();
             let msg = self
                 .state
                 .status_message
@@ -881,6 +882,12 @@ impl App {
                 Ok(LogEvent::RowAppended(row)) => {
                     engine.append_row(row);
                     appended += 1;
+                }
+                Ok(LogEvent::RowsAppended(rows)) => {
+                    appended += rows.len();
+                    for row in rows {
+                        engine.append_row(row);
+                    }
                 }
                 Ok(LogEvent::SourceAdded { source_id, path }) => {
                     engine.add_source(source_id, path.display().to_string());
