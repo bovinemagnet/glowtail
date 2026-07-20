@@ -3188,6 +3188,7 @@ dependencies = [
  "chrono",
  "clap",
  "glowtail-core",
+ "tempfile",
  "tokio",
 ]
 

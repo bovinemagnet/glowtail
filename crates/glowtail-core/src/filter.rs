@@ -643,10 +643,17 @@ fn level_compare(operator: Token, value: String) -> Result<FilterExpr, FilterErr
         Token::Gt => next_level(level)
             .map(FilterExpr::LevelAtLeast)
             .ok_or_else(|| FilterError::InvalidQuery("no log level above fatal".into())),
-        Token::Lte => Ok(next_level(level)
-            .map(|level| FilterExpr::Not(Box::new(FilterExpr::LevelAtLeast(level))))
-            .unwrap_or(FilterExpr::All)),
-        Token::Lt => Ok(FilterExpr::Not(Box::new(FilterExpr::LevelAtLeast(level)))),
+        // `level <= X` / `level < X` must only match rows that actually carry a
+        // level. `and_has_level` ANDs in `LevelAtLeast(Trace)` (false for
+        // unlevelled rows), so stack-trace continuations and plain lines no
+        // longer leak into the result (review MN1).
+        Token::Lte => Ok(and_has_level(match next_level(level) {
+            Some(above) => FilterExpr::Not(Box::new(FilterExpr::LevelAtLeast(above))),
+            None => FilterExpr::All,
+        })),
+        Token::Lt => Ok(and_has_level(FilterExpr::Not(Box::new(
+            FilterExpr::LevelAtLeast(level),
+        )))),
         // Defence in depth: the caller is expected to pre-filter to operator
         // tokens via `consume_operator`, but the `Token` enum has many
         // non-operator variants (`Word`, `LParen`, …). A refactor that routes
@@ -656,6 +663,13 @@ fn level_compare(operator: Token, value: String) -> Result<FilterExpr, FilterErr
             "operator {other:?} not valid for level comparison"
         ))),
     }
+}
+
+/// Wrap a level predicate so it only matches rows that carry a level.
+/// `LevelAtLeast(Trace)` is false for `None`-level rows, so ANDing it in keeps
+/// `level <=`/`<` comparisons from leaking unlevelled rows (review MN1).
+fn and_has_level(predicate: FilterExpr) -> FilterExpr {
+    FilterExpr::And(vec![FilterExpr::LevelAtLeast(LogLevel::Trace), predicate])
 }
 
 fn next_level(level: LogLevel) -> Option<LogLevel> {
@@ -855,6 +869,21 @@ mod tests {
         ]);
         let compiled = CompiledFilter::compile(&expr).unwrap();
         assert!(compiled.matches(&row));
+    }
+
+    #[test]
+    fn level_at_most_excludes_unlevelled_rows() {
+        // Review MN1: `level <= warn` matches levelled rows at or below warn,
+        // but must NOT leak rows with no level (stack continuations, plain text).
+        let expr = parse_filter_query("level <= warn").unwrap();
+        let compiled = CompiledFilter::compile(&expr).unwrap();
+        assert!(compiled.matches(&mk_row("info", Some(LogLevel::Info), SourceId(1))));
+        assert!(compiled.matches(&mk_row("warn", Some(LogLevel::Warn), SourceId(1))));
+        assert!(!compiled.matches(&mk_row("err", Some(LogLevel::Error), SourceId(1))));
+        assert!(
+            !compiled.matches(&mk_row("untagged stack frame", None, SourceId(1))),
+            "level <= warn must not match unlevelled rows"
+        );
     }
 
     #[test]

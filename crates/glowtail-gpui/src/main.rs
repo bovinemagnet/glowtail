@@ -217,7 +217,7 @@ fn next_selected_position(current: Option<usize>, delta: isize, total: usize) ->
 struct Args {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "plain")]
     json: bool,
     #[arg(long)]
     plain: bool,
@@ -584,7 +584,9 @@ impl GlowtailGpui {
 
         if changed {
             self.refresh_metadata();
-            self.save_session();
+            // Session state (saved filters, bookmarks) is unchanged by row
+            // appends, so we don't rewrite the session file every drain tick
+            // (review MN2) — only on session-mutating actions and on Drop.
         }
         changed
     }
@@ -626,8 +628,7 @@ impl GlowtailGpui {
             return;
         }
         let top = self.list_state.logical_scroll_top();
-        let max = total as isize - 1;
-        let new_ix = (top.item_ix as isize + delta).clamp(0, max) as usize;
+        let new_ix = clamped_item_ix(top.item_ix, delta, total);
         self.list_state.scroll_to(ListOffset {
             item_ix: new_ix,
             offset_in_item: Pixels::ZERO,
@@ -1869,12 +1870,30 @@ fn span_color(kind: SpanKind) -> gpui::Rgba {
     }
 }
 
+/// Clamp `current + delta` into `[0, total - 1]`; `0` when `total == 0`.
+/// The list-scroll arithmetic, lifted out of `scroll_by_items` for testing.
+fn clamped_item_ix(current: usize, delta: isize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let max = (total - 1) as isize;
+    (current as isize + delta).clamp(0, max) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PaletteCommand, TextInputState, keystroke_to_input_char, next_saved_filter_cycle,
-        next_selected_position,
+        PaletteCommand, TextInputState, clamped_item_ix, keystroke_to_input_char,
+        next_saved_filter_cycle, next_selected_position,
     };
+
+    #[test]
+    fn clamped_item_ix_clamps_into_range() {
+        assert_eq!(clamped_item_ix(0, -5, 10), 0);
+        assert_eq!(clamped_item_ix(5, 3, 10), 8);
+        assert_eq!(clamped_item_ix(9, 100, 10), 9);
+        assert_eq!(clamped_item_ix(0, 0, 0), 0);
+    }
 
     #[test]
     fn cycle_with_no_saved_filters_returns_none() {
