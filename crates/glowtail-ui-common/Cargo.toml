@@ -10,3 +10,6 @@ chrono.workspace = true
 clap.workspace = true
 glowtail-core = { path = "../glowtail-core" }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

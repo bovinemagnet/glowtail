@@ -31,7 +31,7 @@ jobs:
       - name: Install system deps for GPU UI crates
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config libx11-dev libxcursor-dev libasound2-dev libpulse-dev libxkbcommon-x11-dev
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -43,7 +43,7 @@ jobs:
       - name: Install system deps for GPU UI crates
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config libx11-dev libxcursor-dev libasound2-dev libpulse-dev libxkbcommon-x11-dev
       - run: cargo test --workspace
       - name: Run ignored perf smoke
         run: cargo test -p glowtail-core --test large_viewport -- --ignored

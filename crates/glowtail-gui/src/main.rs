@@ -23,13 +23,21 @@ fn scroll_target(current: usize, delta: isize, total: usize) -> usize {
     (current as isize + delta).clamp(0, max) as usize
 }
 
+/// Vertical scroll offset (px) that pins the last row to the bottom of a
+/// viewport `viewport_h` px tall. Zero when the content is shorter than the
+/// viewport, so follow mode never leaves an empty band beneath the data
+/// (review M4 — previously computed inline and untested).
+fn follow_offset(total_rows: usize, row_height: f32, viewport_h: f32) -> f32 {
+    (total_rows as f32 * row_height - viewport_h).max(0.0)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "glowtail-gui")]
 #[command(about = "Native GPU-backed glowtail desktop UI")]
 struct Args {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "plain")]
     json: bool,
     #[arg(long)]
     plain: bool,
@@ -438,7 +446,7 @@ impl GlowtailGui {
                 // `total * ROW_HEIGHT` placed the row *after* the last at
                 // the top, leaving an empty band beneath the data.
                 let viewport_h = ui.available_height();
-                let needed = (total_matching_rows as f32 * ROW_HEIGHT - viewport_h).max(0.0);
+                let needed = follow_offset(total_matching_rows, ROW_HEIGHT, viewport_h);
                 scroll = scroll.vertical_scroll_offset(needed);
             } else if let Some(row) = self.scroll_to_row.take() {
                 scroll = scroll.vertical_scroll_offset(row as f32 * ROW_HEIGHT);
@@ -897,7 +905,7 @@ fn severity_color(role: SeverityRole) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::scroll_target;
+    use super::{follow_offset, scroll_target};
 
     #[test]
     fn scroll_target_clamps_below_zero() {
@@ -920,5 +928,18 @@ mod tests {
     fn scroll_target_with_empty_list_returns_zero() {
         assert_eq!(scroll_target(0, 0, 0), 0);
         assert_eq!(scroll_target(10, 5, 0), 0);
+    }
+
+    #[test]
+    fn follow_offset_is_zero_when_content_fits_viewport() {
+        // 3 rows * 22px = 66px content in a 100px viewport — no scroll needed.
+        assert_eq!(follow_offset(3, 22.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn follow_offset_pins_last_row_to_bottom_when_overflowing() {
+        // 10 rows * 22px = 220px content; a 100px viewport scrolls 120px so the
+        // last row sits at the bottom edge (review M4).
+        assert_eq!(follow_offset(10, 22.0, 100.0), 120.0);
     }
 }

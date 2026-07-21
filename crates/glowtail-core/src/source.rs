@@ -677,4 +677,83 @@ mod tests {
         assert!(rows[0].message.contains("ok"));
         assert_eq!(errors, 0, "invalid UTF-8 must not error the source");
     }
+
+    #[tokio::test]
+    async fn resets_to_start_and_emits_rotated_when_file_shrinks() {
+        let tmp = NamedTempFile::new().unwrap();
+        tokio::fs::write(tmp.path(), b"first line\nsecond line\n")
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let tailer = FileTailer::start(
+            SourceId(4),
+            tmp.path().to_path_buf(),
+            Arc::new(CompositeParser::default()),
+            tx,
+            true,
+            true,
+        );
+
+        // Let the tailer read the two existing lines.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Truncate to a shorter generation; the next poll sees file_len < offset
+        // and should treat it as a rotation (reset cursor to 0).
+        tokio::fs::write(tmp.path(), b"rotated\n").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tailer.stop().await;
+
+        let mut saw_rotated = false;
+        let mut saw_rotated_row = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                LogEvent::SourceRotated { .. } => saw_rotated = true,
+                LogEvent::RowAppended(row) if row.message.as_ref() == "rotated" => {
+                    saw_rotated_row = true;
+                }
+                LogEvent::RowsAppended(batch)
+                    if batch.iter().any(|row| row.message.as_ref() == "rotated") =>
+                {
+                    saw_rotated_row = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_rotated,
+            "expected a SourceRotated event after truncation"
+        );
+        assert!(
+            saw_rotated_row,
+            "expected the post-rotation line to be read from offset 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_source_error_for_unreadable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.log");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        // follow = false: the open-failure path runs once and the task ends.
+        let tailer = FileTailer::start(
+            SourceId(5),
+            missing,
+            Arc::new(CompositeParser::default()),
+            tx,
+            false,
+            false,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tailer.stop().await;
+
+        let mut saw_error = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, LogEvent::SourceError { .. }) {
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "expected a SourceError for a non-existent path");
+    }
 }

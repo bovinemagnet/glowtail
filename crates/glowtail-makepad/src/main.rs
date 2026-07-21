@@ -46,7 +46,7 @@ const PAGE_SIZE: usize = 1024;
 struct Args {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "plain")]
     json: bool,
     #[arg(long)]
     plain: bool,
@@ -543,8 +543,7 @@ impl App {
             .selected_row_id
             .and_then(|id| engine.filtered_position_for_row(id))
             .unwrap_or(0);
-        let max = total.saturating_sub(1) as isize;
-        let next = (current as isize + delta).clamp(0, max) as usize;
+        let next = clamped_position(current, delta, total);
         let row = engine.present_row_at(next)?;
         self.state.selected_row_id = Some(row.row_id);
         self.state.follow = false;
@@ -1170,8 +1169,26 @@ impl App {
 /// and below the new cursor position.
 const PAGE_STEP: usize = 24;
 
+/// Clamp `current + delta` into `[0, total - 1]`; returns `0` when `total == 0`.
+/// The selection-movement arithmetic, lifted out of `move_selection` so it can
+/// be unit-tested.
+fn clamped_position(current: usize, delta: isize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let max = (total - 1) as isize;
+    (current as isize + delta).clamp(0, max) as usize
+}
+
 impl Drop for App {
     fn drop(&mut self) {
+        // Signal the tailer tasks to stop without blocking; the runtime drives
+        // them to completion when it is dropped (review LN3).
+        if let Some(live_tail) = self.state.live_tail.as_ref() {
+            for tailer in &live_tail.tailers {
+                tailer.signal_stop();
+            }
+        }
         if let (Some(path), Some(engine)) =
             (self.state.session_path.as_ref(), self.state.engine.as_ref())
             && let Err(err) = save_session(Some(path), engine.session())
@@ -1436,6 +1453,14 @@ fn span_slot_id(index: usize) -> &'static [LiveId] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamped_position_clamps_into_range() {
+        assert_eq!(clamped_position(0, -5, 10), 0);
+        assert_eq!(clamped_position(5, 3, 10), 8);
+        assert_eq!(clamped_position(9, 100, 10), 9);
+        assert_eq!(clamped_position(0, 0, 0), 0);
+    }
 
     #[test]
     fn normalise_max_rows_treats_zero_as_unbounded() {

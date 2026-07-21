@@ -332,4 +332,62 @@ mod tests {
         let filter = apply_filters(&mut engine, None, Some(LevelArg::Warn), None, None).unwrap();
         assert_eq!(filter, FilterExpr::LevelAtLeast(LogLevel::Warn));
     }
+
+    #[test]
+    fn apply_filters_with_unknown_use_filter_name_errors() {
+        let mut engine = Engine::default();
+        let result = apply_filters(&mut engine, None, None, Some("does-not-exist".into()), None);
+        assert!(
+            result.is_err(),
+            "unknown saved filter should error, not silently pass"
+        );
+    }
+
+    #[test]
+    fn load_session_of_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+        let session = load_session(Some(&path)).unwrap();
+        // A fresh default session has no saved filters and no bookmarks.
+        assert!(session.saved_filter("anything").is_none());
+    }
+
+    #[test]
+    fn save_session_with_no_path_is_a_noop() {
+        let session = InvestigationSession::default();
+        assert!(save_session(None, &session).is_ok());
+    }
+
+    #[test]
+    fn save_session_creates_missing_parent_directories_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately nested path whose parents don't exist yet.
+        let path = dir.path().join("nested/sub/dir/session.json");
+        let mut session = InvestigationSession::default();
+        session.save_filter("errors", FilterExpr::LevelAtLeast(LogLevel::Error));
+
+        save_session(Some(&path), &session).unwrap();
+        assert!(
+            path.exists(),
+            "save_session should create parent directories"
+        );
+
+        let loaded = load_session(Some(&path)).unwrap();
+        assert_eq!(
+            loaded.saved_filter("errors"),
+            Some(&FilterExpr::LevelAtLeast(LogLevel::Error)),
+        );
+    }
+
+    #[test]
+    fn session_round_trips_bookmarks_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut session = InvestigationSession::default();
+        session.toggle_bookmark(RowId(7), Some(std::sync::Arc::from("root cause")));
+
+        save_session(Some(&path), &session).unwrap();
+        let loaded = load_session(Some(&path)).unwrap();
+        assert!(loaded.is_bookmarked(RowId(7)));
+    }
 }

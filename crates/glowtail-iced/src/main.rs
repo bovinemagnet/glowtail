@@ -45,7 +45,7 @@ const PAGE_SIZE: usize = 200;
 struct Args {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "plain")]
     json: bool,
     #[arg(long)]
     plain: bool,
@@ -351,18 +351,14 @@ impl GlowtailIced {
     }
 
     fn snap_to_tail(&mut self) {
-        self.first_row = self.total_matching_rows.saturating_sub(PAGE_SIZE);
+        self.first_row = max_first_row(self.total_matching_rows, PAGE_SIZE);
     }
 
     /// Scroll the viewport so that the row at `position` (within the
     /// filtered set) is visible. Used by selection navigation and the
     /// n/N search keys so the cursor doesn't disappear off-screen.
     fn scroll_to_position(&mut self, position: usize) {
-        if position < self.first_row {
-            self.first_row = position;
-        } else if position >= self.first_row + PAGE_SIZE {
-            self.first_row = position.saturating_sub(PAGE_SIZE - 1);
-        }
+        self.first_row = next_first_row(self.first_row, position, PAGE_SIZE);
     }
 
     fn apply_current_filters(&mut self) {
@@ -533,7 +529,7 @@ impl GlowtailIced {
                 self.first_row = self
                     .first_row
                     .saturating_add(PAGE_SIZE)
-                    .min(self.total_matching_rows.saturating_sub(1));
+                    .min(max_first_row(self.total_matching_rows, PAGE_SIZE));
                 self.refresh_snapshot();
                 Task::none()
             }
@@ -1081,8 +1077,36 @@ impl GlowtailIced {
     }
 }
 
+/// New `first_row` so the row at `position` is visible in a `page_size`-tall
+/// window currently starting at `first_row`. Scrolls up when the position is
+/// above the window and down (keeping it on the last visible line) when below.
+fn next_first_row(first_row: usize, position: usize, page_size: usize) -> usize {
+    if position < first_row {
+        position
+    } else if position >= first_row + page_size {
+        position.saturating_sub(page_size.saturating_sub(1))
+    } else {
+        first_row
+    }
+}
+
+/// Largest `first_row` that still shows a full last page of `page_size` rows.
+/// Used by tail-snap and PageDown so the viewport ends on a full page instead
+/// of a single trailing row (review LN5).
+fn max_first_row(total: usize, page_size: usize) -> usize {
+    total.saturating_sub(page_size)
+}
+
 impl Drop for GlowtailIced {
     fn drop(&mut self) {
+        // Signal the tailer tasks to stop. Non-blocking: the runtime drives
+        // them to completion when it is dropped (the field order keeps
+        // `live_tail` alive until then). Never `block_on` from Drop (review LN3).
+        if let Some(live_tail) = self.live_tail.as_ref() {
+            for tailer in &live_tail.tailers {
+                tailer.signal_stop();
+            }
+        }
         if let Some(path) = self.session_path.as_ref()
             && let Err(err) = save_session(Some(path), self.engine.session())
         {
@@ -1218,6 +1242,29 @@ fn cycle_level(current: Option<LevelArg>) -> Option<LevelArg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_first_row_scrolls_up_to_reveal_position_above_window() {
+        assert_eq!(next_first_row(50, 10, 200), 10);
+    }
+
+    #[test]
+    fn next_first_row_keeps_window_when_position_already_visible() {
+        assert_eq!(next_first_row(50, 60, 200), 50);
+    }
+
+    #[test]
+    fn next_first_row_scrolls_down_to_keep_position_on_last_line() {
+        // position 250 in a 200-row window from 0 -> first_row = 250 - 199 = 51.
+        assert_eq!(next_first_row(0, 250, 200), 51);
+    }
+
+    #[test]
+    fn max_first_row_leaves_a_full_last_page() {
+        assert_eq!(max_first_row(1000, 200), 800);
+        // Fewer rows than a page -> stay at the top.
+        assert_eq!(max_first_row(150, 200), 0);
+    }
 
     #[test]
     fn normalise_max_rows_treats_zero_as_unbounded() {

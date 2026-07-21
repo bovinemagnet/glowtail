@@ -336,4 +336,67 @@ mod tests {
         state.expire_status_if_due();
         assert!(state.status_message.is_none());
     }
+
+    #[test]
+    fn move_selection_down_advances_offset_within_window() {
+        let mut state = state_at(0, 0);
+        state.follow = true;
+        move_selection_down(&mut state, 5, 10);
+        assert_eq!(state.selected_offset, 1);
+        assert_eq!(state.first_row, 0);
+        assert!(!state.follow, "moving the cursor should leave follow mode");
+    }
+
+    #[test]
+    fn move_selection_down_scrolls_window_at_bottom_edge() {
+        // selected_offset already at the last visible row (visible_rows = 5).
+        let mut state = state_at(0, 4);
+        move_selection_down(&mut state, 5, 10);
+        assert_eq!(state.selected_offset, 4);
+        assert_eq!(
+            state.first_row, 1,
+            "window should scroll once the cursor is pinned"
+        );
+    }
+
+    #[test]
+    fn move_selection_up_walks_first_row_back_at_top_edge() {
+        let mut state = state_at(3, 0);
+        move_selection_up(&mut state);
+        assert_eq!(state.first_row, 2);
+        assert_eq!(state.selected_offset, 0);
+        assert!(!state.follow);
+    }
+
+    #[test]
+    fn apply_input_with_invalid_filter_query_sets_error_status() {
+        let mut engine = Engine::default();
+        let mut state = TuiState {
+            input_mode: InputMode::Filter,
+            input: "level =".to_string(),
+            ..TuiState::default()
+        };
+        apply_input(&mut engine, &mut state);
+        let (message, _) = state
+            .status_message
+            .as_ref()
+            .expect("an invalid filter query should set a status message");
+        assert!(message.contains("filter error"), "got: {message}");
+    }
+
+    #[test]
+    fn toggle_bookmark_on_empty_viewport_sets_status() {
+        let mut engine = Engine::default();
+        let snapshot = engine.viewport(glowtail_core::model::ViewportRequest {
+            first_row: 0,
+            row_count: 10,
+        });
+        let mut state = TuiState::default();
+        toggle_bookmark(&mut engine, &snapshot, &mut state);
+        let (message, _) = state
+            .status_message
+            .as_ref()
+            .expect("bookmarking an empty viewport should set a status");
+        assert!(message.contains("no row to bookmark"), "got: {message}");
+    }
 }
